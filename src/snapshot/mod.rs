@@ -6,10 +6,12 @@ pub mod mock;
 mod p2p;
 pub mod repository;
 pub(crate) mod runtime_support;
+mod squash;
 mod types;
 
 pub use manager::SnapshotManager;
 pub use repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+pub use squash::{squash_snapshot, SquashOutcome};
 pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,

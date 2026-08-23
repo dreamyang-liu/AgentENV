@@ -9,6 +9,7 @@ use tabled::Tabled;
   aenv snapshot create <sandbox-id> --name my-base
   aenv snapshot ls
   aenv snapshot ls --sandbox-id <sandbox-id>
+  aenv snapshot squash <snapshot-id> --name my-base-flat
   aenv start my-base
 
 Snapshots are persistent and reusable. Use `aenv start <snapshot>` to create one or more new sandboxes from a snapshot.")]
@@ -30,6 +31,18 @@ enum Sub {
         #[arg(long = "disk-only")]
         disk_only: bool,
     },
+    /// Merge a snapshot's layer chain into a new, flattened snapshot
+    ///
+    /// Sandboxes created from a snapshot inherit its layers as an immutable
+    /// prefix, so branching from a deep snapshot leaves the child with short
+    /// compaction cycles. Squashing publishes an equivalent snapshot whose
+    /// chain is a single layer; the source snapshot is left untouched.
+    Squash {
+        snapshot_id: String,
+        /// Alias for the squashed snapshot.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// List persistent snapshots
     #[command(visible_alias = "ls")]
     List {
@@ -49,6 +62,7 @@ pub fn run(args: Args) -> Result<()> {
             name,
             disk_only,
         } => create(&client, &sandbox_id, name.as_deref(), disk_only),
+        Sub::Squash { snapshot_id, name } => squash(&client, &snapshot_id, name.as_deref()),
         Sub::List { sandbox_id, output } => {
             list(&client, sandbox_id.as_deref(), output::resolve(output))
         }
@@ -70,6 +84,22 @@ fn create(client: &Client, sandbox_id: &str, name: Option<&str>, disk_only: bool
     println!("Created snapshot {}", snapshot.snapshot_id);
     if let Some(image_ref) = &snapshot.image_ref {
         println!("Image: {image_ref}");
+    }
+    Ok(())
+}
+
+fn squash(client: &Client, snapshot_id: &str, name: Option<&str>) -> Result<()> {
+    let snapshot = client.squash_snapshot(snapshot_id, name)?;
+    if snapshot.snapshot_id == snapshot_id {
+        println!("Snapshot {snapshot_id} chain is already flat; nothing to squash");
+        return Ok(());
+    }
+    println!("Squashed into snapshot {}", snapshot.snapshot_id);
+    if let Some(layers) = snapshot.rootfs_layer_count {
+        println!("Rootfs layers: {layers}");
+    }
+    if let Some(size) = snapshot.chain_size_mb {
+        println!("Chain size: {size} MiB");
     }
     Ok(())
 }

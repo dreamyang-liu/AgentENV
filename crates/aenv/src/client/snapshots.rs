@@ -3,6 +3,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
+struct SquashSnapshot<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
 struct CreateSnapshot<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
@@ -18,6 +24,18 @@ pub struct SnapshotInfo {
     pub names: Vec<String>,
     #[serde(rename = "imageRef", default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+    #[serde(
+        rename = "rootfsLayerCount",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rootfs_layer_count: Option<u32>,
+    #[serde(
+        rename = "chainSizeMB",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub chain_size_mb: Option<u64>,
 }
 
 impl Client {
@@ -30,6 +48,15 @@ impl Client {
         let body = CreateSnapshot { name, disk_only };
         let resp = handle_status(
             self.post(&format!("/sandboxes/{}/snapshots", sandbox_id))
+                .send_json(&body),
+        )?;
+        Ok(resp.into_json()?)
+    }
+
+    pub fn squash_snapshot(&self, snapshot_id: &str, name: Option<&str>) -> Result<SnapshotInfo> {
+        let body = SquashSnapshot { name };
+        let resp = handle_status(
+            self.post(&format!("/snapshots/{}/squash", snapshot_id))
                 .send_json(&body),
         )?;
         Ok(resp.into_json()?)

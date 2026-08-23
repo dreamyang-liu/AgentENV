@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use overlaybd::config::LayerConfig;
 
 const SNAPSHOT_DELTA_LAYER_FILE: &str = "snapshot.commit";
-const SELF_CONTAINED_BASE_LAYER_FILE: &str = "managed-base.commit";
+pub(crate) const SELF_CONTAINED_BASE_LAYER_FILE: &str = "managed-base.commit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalLayer {

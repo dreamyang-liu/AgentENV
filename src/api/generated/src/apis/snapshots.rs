@@ -39,6 +39,22 @@ pub enum SnapshotsSnapshotIdGetResponse {
     Status500_ServerError(models::Error),
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SnapshotsSnapshotIdSquashPostResponse {
+    /// Squashed snapshot published, or source returned when already flat
+    Status201_SquashedSnapshotPublished(models::SnapshotInfo),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
 /// Snapshots
 #[async_trait]
 #[allow(clippy::ptr_arg)]
@@ -70,4 +86,18 @@ pub trait Snapshots<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, E>;
+
+    /// Squash snapshot chain.
+    ///
+    /// SnapshotsSnapshotIdSquashPost - POST /snapshots/{snapshotID}/squash
+    async fn snapshots_snapshot_id_squash_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdSquashPostPathParams,
+        body: &models::SnapshotSquashRequest,
+    ) -> Result<SnapshotsSnapshotIdSquashPostResponse, E>;
 }

@@ -8,7 +8,7 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{squash_snapshot, SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -185,6 +185,67 @@ impl Snapshots<()> for ApiImpl {
             Err(err) => Ok(SnapshotsSnapshotIdGetResponse::Status500_ServerError(
                 Self::snapshot_manager_error(&err),
             )),
+        }
+    }
+
+    async fn snapshots_snapshot_id_squash_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdSquashPostPathParams,
+        body: &models::SnapshotSquashRequest,
+    ) -> Result<SnapshotsSnapshotIdSquashPostResponse, ()> {
+        let alias = match &body.name {
+            Some(name) => match SnapshotAlias::parse(name) {
+                Ok(alias) => Some(alias),
+                Err(err) => {
+                    return Ok(SnapshotsSnapshotIdSquashPostResponse::Status400_BadRequest(
+                        Self::error(400, format!("invalid snapshot alias: {err}")),
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // The squash itself is repository-side work: it merges committed
+        // layers and publishes a new snapshot, so no sandbox is involved and
+        // no VM is paused.
+        match squash_snapshot(&self.snapshot_manager, &path_params.snapshot_id, alias).await {
+            Ok(outcome) => Ok(
+                SnapshotsSnapshotIdSquashPostResponse::Status201_SquashedSnapshotPublished(
+                    models::SnapshotInfo::from(outcome.record()),
+                ),
+            ),
+            Err(err) => {
+                let message = format!("{err:#}");
+                if message.contains("not found") {
+                    return Ok(SnapshotsSnapshotIdSquashPostResponse::Status404_NotFound(
+                        Self::error(
+                            404,
+                            format!("snapshot '{}' not found", path_params.snapshot_id),
+                        ),
+                    ));
+                }
+                // Unsupported chain shapes (remote layers, snapshots that are
+                // not ready) are caller-visible input problems, not faults.
+                if message.contains("cannot squash") || message.contains("is not ready") {
+                    return Ok(SnapshotsSnapshotIdSquashPostResponse::Status400_BadRequest(
+                        Self::error(400, message),
+                    ));
+                }
+                tracing::warn!(
+                    snapshot_ref = %path_params.snapshot_id,
+                    error = %message,
+                    "failed to squash snapshot"
+                );
+                Ok(
+                    SnapshotsSnapshotIdSquashPostResponse::Status500_ServerError(Self::error(
+                        500, message,
+                    )),
+                )
+            }
         }
     }
 }

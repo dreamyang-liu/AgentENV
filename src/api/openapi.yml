@@ -689,6 +689,13 @@ components:
             snapshot's startup command. Guest filesystem buffers are synced
             before capture.
 
+    SnapshotSquashRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Optional alias for the squashed snapshot.
+
     SandboxForkRequest:
       type: object
       properties:
@@ -1953,6 +1960,60 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnapshotInfo"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /snapshots/{snapshotID}/squash:
+    post:
+      summary: Squash snapshot chain
+      description: >-
+        Merge a committed snapshot's rootfs (and memory) layer chain into
+        single layers and publish the result as a new, equivalent snapshot.
+        The source snapshot is left untouched, so snapshots and sandboxes that
+        reference its layers keep working.
+
+        Captures can only compact layers produced by the capturing sandbox;
+        layers inherited from the snapshot it launched from stay immutable. A
+        sandbox created from a deep snapshot therefore inherits that whole
+        prefix, which shortens its compaction cycles and, across generations,
+        approaches the layer-stack limit. Branching from a squashed snapshot
+        resets that prefix to a single layer.
+
+        Cost scales with chain size (merge throughput is bound by the snapshot
+        store's sequential write bandwidth), and the merged layer is additive
+        storage until the source snapshot's layers become unreferenced. When
+        the chain is already a single layer the source snapshot is returned
+        unchanged. Attached-drive chains are not squashed. Requires locally
+        materialized layers (POSIX repository backend).
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AccessTokenAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotSquashRequest"
+      responses:
+        "201":
+          description: Squashed snapshot published, or source returned when already flat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotInfo"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":

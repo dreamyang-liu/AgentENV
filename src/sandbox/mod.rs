@@ -37,6 +37,7 @@ pub use firecracker::{
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
+pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
