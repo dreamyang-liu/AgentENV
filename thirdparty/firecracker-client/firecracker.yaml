@@ -878,6 +878,35 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges/reset:
+    put:
+      summary: Resets dirty memory tracking.
+      description:
+        Discards all dirty page tracking state so later dirty-memory-ranges
+        queries report only pages dirtied after this call. Intended for
+        external snapshot packaging, after the pages returned by the query
+        have been durably persisted. Requires a paused, post-boot VM; the
+        request body is ignored and may be an empty JSON object.
+      operationId: resetDirtyMemoryRanges
+      parameters:
+        - name: body
+          in: body
+          description: Ignored placeholder body.
+          required: true
+          schema:
+            type: object
+      responses:
+        204:
+          description: Dirty memory tracking reset
+        400:
+          description: VM is not in a valid state for this operation
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/config:
     get:
       summary: Gets the full VM configuration.

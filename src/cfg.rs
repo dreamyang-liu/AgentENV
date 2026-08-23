@@ -453,6 +453,15 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// EXPERIMENTAL: make successive memory snapshots of one sandbox
+    /// incremental. Each capture stacks a layer holding only the pages
+    /// dirtied since the previous capture (instead of every page dirtied
+    /// since launch) and then resets Firecracker's dirty tracking baseline.
+    /// Requires `track_dirty_pages` and a Firecracker build that ships
+    /// `PUT /vm/dirty-memory-ranges/reset`; without that API the reset fails
+    /// and captures safely stay cumulative.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LAYERS", default = false)]
+    pub incremental_layers: bool,
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]
@@ -895,6 +904,12 @@ impl AppConfig {
         // validation so an existing PVM configuration needs no new override.
         if self.virtualization_mode == VirtualizationMode::Pvm {
             self.memory_snapshot.track_dirty_pages = false;
+        }
+        // Incremental memory layers need per-interval dirty semantics, which
+        // only KVM dirty-page tracking provides (mincore reports the
+        // cumulative present set and cannot be reset).
+        if !self.memory_snapshot.track_dirty_pages {
+            self.memory_snapshot.incremental_layers = false;
         }
 
         self.cluster.normalize();

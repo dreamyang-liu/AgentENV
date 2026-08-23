@@ -193,6 +193,12 @@ pub struct FirecrackerSandbox {
     /// but a fresh boot must re-launch the snapshot's services. Consumed
     /// (taken) by the first [`FirecrackerSandbox::wait_for_ready`].
     cold_boot_startup: std::sync::Mutex<Option<crate::snapshot::StartupCommand>>,
+    /// Parent memory image config for the next capture: the launch-time
+    /// memory chain initially, advanced to the newest capture's
+    /// `mem_image.json` when incremental memory layers are enabled and the
+    /// dirty-tracking baseline was successfully reset. Never advanced in
+    /// cumulative mode, so each capture keeps inheriting the launch chain.
+    mem_parent_image_config: Option<PathBuf>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
     /// Delivers the custom extension stop hook exactly once: `stop()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
@@ -776,10 +782,55 @@ impl FirecrackerSandbox {
 
         let snapshot_result = self.snapshot_to_dir(snapshot_dir, disk_only).await;
         match snapshot_result {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => {
+                self.advance_memory_baseline_after_capture(&snapshot.1)
+                    .await;
+                Ok(snapshot)
+            }
             Err(err) => {
                 Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
                 Err(err)
+            }
+        }
+    }
+
+    /// Advances the incremental-memory baseline after a successful capture.
+    ///
+    /// With `[memory_snapshot] incremental_layers` enabled, resets
+    /// Firecracker's dirty tracking (so the next capture's memory layer holds
+    /// only newly dirtied pages) and re-parents the next capture onto this
+    /// capture's memory chain. Must run while the VM is still paused: after a
+    /// resume, pages dirtied between the capture and the reset would be lost
+    /// from tracking.
+    ///
+    /// Best-effort by design: a captured layer always holds every page
+    /// dirtied since the current baseline, so when the reset fails (for
+    /// example on a Firecracker build without the reset API) the baseline
+    /// simply stays put and the next capture is a safe superset.
+    async fn advance_memory_baseline_after_capture(
+        &mut self,
+        manifest: &FirecrackerSnapshotManifest,
+    ) {
+        if !ConfigManager::global_config()
+            .memory_snapshot
+            .incremental_layers
+        {
+            return;
+        }
+        // Disk-only captures leave memory tracking untouched: the bitmap
+        // keeps accumulating and a later full capture picks everything up.
+        let Some(memory) = manifest.memory.as_ref() else {
+            return;
+        };
+        match self.fc_instance.reset_dirty_memory_ranges().await {
+            Ok(()) => {
+                self.mem_parent_image_config = Some(memory.image_config_path.clone());
+            }
+            Err(err) => {
+                warn!(
+                    error = %format_args!("{err:#}"),
+                    "failed to reset dirty memory tracking; the next capture stays cumulative from the current baseline"
+                );
             }
         }
     }
@@ -805,13 +856,10 @@ impl FirecrackerSandbox {
 
             // Build the memory image config: collect parent layers, make runtime
             // lowers local to this snapshot dir, and compact only if the layer
-            // count exceeds the configured maximum.
-            let resume_mem_image_config_path = match &self.launch {
-                LaunchMode::Resume(config) => {
-                    Some(config.mem_overlaybd_config.image_config_path.as_path())
-                }
-                LaunchMode::Fresh(_) => None,
-            };
+            // count exceeds the configured maximum. The parent chain is the
+            // launch-time memory chain, advanced to the previous capture's
+            // chain when incremental memory layers are enabled.
+            let resume_mem_image_config_path = self.mem_parent_image_config.as_deref();
             let mem_image_config = build_mem_snapshot_image_config(
                 resume_mem_image_config_path,
                 &mem_layer_path,
@@ -1323,6 +1371,12 @@ impl FirecrackerSandbox {
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
         let runtime_policy = launch.common().runtime_policy;
+        let mem_parent_image_config = match &launch {
+            LaunchMode::Resume(config) => {
+                Some(config.mem_overlaybd_config.image_config_path.clone())
+            }
+            LaunchMode::Fresh(_) => None,
+        };
         let current_network_policy = launch.common().network_policy.clone();
         let current_custom_extension_params = launch.common().custom_extension_params.clone();
         debug!(work_dir = %work_dir.path().display(), "sandbox work directory prepared");
@@ -1347,6 +1401,7 @@ impl FirecrackerSandbox {
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             cold_boot_startup: std::sync::Mutex::new(None),
+            mem_parent_image_config,
             live_snapshot_root: None,
             custom_extension_hook_guard: None,
         })

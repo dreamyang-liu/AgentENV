@@ -473,6 +473,26 @@ impl FirecrackerInstance {
             .context("Failed to get dirty memory ranges")
     }
 
+    /// Resets Firecracker's dirty memory tracking so subsequent
+    /// [`FirecrackerInstance::get_dirty_memory_ranges`] queries report only
+    /// pages dirtied after this call.
+    ///
+    /// Requires a paused VM and a Firecracker build that ships
+    /// `PUT /vm/dirty-memory-ranges/reset`; call it only after the captured
+    /// memory layer has been durably persisted, because the discarded dirty
+    /// bits are unrecoverable.
+    #[tracing::instrument(skip(self))]
+    pub async fn reset_dirty_memory_ranges(&self) -> Result<()> {
+        self.client
+            .request_no_content(
+                Method::PUT,
+                "/vm/dirty-memory-ranges/reset",
+                Some(&serde_json::json!({})),
+            )
+            .await
+            .context("Failed to reset dirty memory ranges")
+    }
+
     /// Loads a snapshot with uffd memory backend.
     /// Pre-boot only.
     #[allow(dead_code)]

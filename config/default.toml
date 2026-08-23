@@ -311,6 +311,14 @@ fill_concurrency = 4
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
 
+# EXPERIMENTAL: make successive memory snapshots of one sandbox incremental.
+# Each capture stores only the pages dirtied since the previous capture and
+# then resets Firecracker's dirty-tracking baseline, instead of re-capturing
+# every page dirtied since launch. Requires track_dirty_pages and a
+# Firecracker build with PUT /vm/dirty-memory-ranges/reset; without that API
+# the reset fails harmlessly and captures stay cumulative.
+incremental_layers = false
+
 # Compress memory snapshot layers. The algorithm is parsed but ignored when
 # compression is disabled.
 compression_enabled = false
