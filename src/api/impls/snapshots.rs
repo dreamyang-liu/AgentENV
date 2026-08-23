@@ -22,6 +22,11 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
         } else {
             vec![]
         };
+        let (rootfs_layer_count, memory_layer_count, chain_size_mb) = record
+            .committed
+            .as_ref()
+            .map(committed_chain_stats)
+            .unwrap_or((None, None, None));
         models::SnapshotInfo {
             snapshot_id,
             names,
@@ -35,8 +40,42 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            rootfs_layer_count,
+            memory_layer_count,
+            chain_size_mb,
         }
     }
+}
+
+/// Chain observability facts for a committed snapshot: rootfs layer count,
+/// memory layer count, and the total committed layer bytes (rootfs + memory
+/// + attached drives) in MiB, before cross-snapshot dedup.
+fn committed_chain_stats(
+    committed: &crate::snapshot::CommittedSnapshot,
+) -> (Option<i32>, Option<i32>, Option<i64>) {
+    fn layer_ref_size(layer: &crate::snapshot::OverlaybdLayerRef) -> u64 {
+        match layer {
+            crate::snapshot::OverlaybdLayerRef::Managed(managed) => managed.size,
+            crate::snapshot::OverlaybdLayerRef::External(external) => external.size,
+        }
+    }
+
+    let mut total_bytes: u64 = committed.rootfs_layers.iter().map(layer_ref_size).sum();
+    total_bytes += committed
+        .memory_layers
+        .iter()
+        .map(|layer| layer.size)
+        .sum::<u64>();
+    for drive in &committed.attached_drives {
+        let crate::snapshot::CommittedAttachedDrive::Overlaybd { layers, .. } = drive;
+        total_bytes += layers.iter().map(layer_ref_size).sum::<u64>();
+    }
+
+    (
+        i32::try_from(committed.rootfs_layers.len()).ok(),
+        i32::try_from(committed.memory_layers.len()).ok(),
+        i64::try_from(total_bytes / (1024 * 1024)).ok(),
+    )
 }
 
 fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {

@@ -6636,6 +6636,21 @@ pub struct SnapshotInfo {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+
+    /// Number of stacked overlaybd layers in the committed rootfs chain. A sandbox launched from this snapshot inherits these layers as an immutable prefix, so this value drives chain-health decisions (e.g. squash-before-branch); a drop between successive snapshots of one sandbox signals that the capture compacted the chain.
+    #[serde(rename = "rootfsLayerCount")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rootfs_layer_count: Option<i32>,
+
+    /// Number of stacked overlaybd layers in the committed memory chain. 0 for disk-only snapshots.
+    #[serde(rename = "memoryLayerCount")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_layer_count: Option<i32>,
+
+    /// Total size in MiB of all committed layers (rootfs, memory, and attached drives) referenced by this snapshot, before content-addressed dedup against other snapshots.
+    #[serde(rename = "chainSizeMB")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_size_mb: Option<i64>,
 }
 
 impl SnapshotInfo {
@@ -6658,6 +6673,9 @@ impl SnapshotInfo {
             created_at,
             updated_at,
             image_ref: None,
+            rootfs_layer_count: None,
+            memory_layer_count: None,
+            chain_size_mb: None,
         }
     }
 }
@@ -6690,6 +6708,23 @@ impl std::fmt::Display for SnapshotInfo {
             self.image_ref
                 .as_ref()
                 .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
+            self.rootfs_layer_count.as_ref().map(|rootfs_layer_count| {
+                [
+                    "rootfsLayerCount".to_string(),
+                    rootfs_layer_count.to_string(),
+                ]
+                .join(",")
+            }),
+            self.memory_layer_count.as_ref().map(|memory_layer_count| {
+                [
+                    "memoryLayerCount".to_string(),
+                    memory_layer_count.to_string(),
+                ]
+                .join(",")
+            }),
+            self.chain_size_mb.as_ref().map(|chain_size_mb| {
+                ["chainSizeMB".to_string(), chain_size_mb.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -6719,6 +6754,9 @@ impl std::str::FromStr for SnapshotInfo {
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub image_ref: Vec<String>,
+            pub rootfs_layer_count: Vec<i32>,
+            pub memory_layer_count: Vec<i32>,
+            pub chain_size_mb: Vec<i64>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6776,6 +6814,18 @@ impl std::str::FromStr for SnapshotInfo {
                     "imageRef" => intermediate_rep.image_ref.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "rootfsLayerCount" => intermediate_rep.rootfs_layer_count.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryLayerCount" => intermediate_rep.memory_layer_count.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "chainSizeMB" => intermediate_rep.chain_size_mb.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SnapshotInfo".to_string(),
@@ -6826,6 +6876,9 @@ impl std::str::FromStr for SnapshotInfo {
                 .next()
                 .ok_or_else(|| "updatedAt missing in SnapshotInfo".to_string())?,
             image_ref: intermediate_rep.image_ref.into_iter().next(),
+            rootfs_layer_count: intermediate_rep.rootfs_layer_count.into_iter().next(),
+            memory_layer_count: intermediate_rep.memory_layer_count.into_iter().next(),
+            chain_size_mb: intermediate_rep.chain_size_mb.into_iter().next(),
         })
     }
 }
