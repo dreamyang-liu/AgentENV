@@ -212,6 +212,19 @@ auto_resume_min_sandbox_timeout_secs = 300
 # - "oss" stores snapshots in S3-compatible object storage.
 repository_backend = "posix_fs"
 
+# Compaction triggers for persisted snapshot chains (rootfs and memory).
+# A capture compacts its chain's runtime-owned layers into one layer when the
+# layer count would exceed max_stacked_layers (clamped to [2, 240]; the LSMT
+# format caps stacks at 255), or when those layers exceed max_chain_size_mib
+# MiB (0 disables the size trigger). The size trigger bounds the cost of a
+# single compaction: merge throughput is limited by the snapshot store's
+# sequential write bandwidth (~write_bw x chain size). Pair a fired
+# compaction with re-launching from that snapshot ("re-boarding"): the live
+# device stack is never compacted, so captures after a trigger re-compact
+# every step until the sandbox is replaced.
+max_stacked_layers = 32
+max_chain_size_mib = 0
+
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
 # resolution. Effective only when [p2p].enabled is also true. POSIX fixed
 # artifacts remain authoritative in their repository.

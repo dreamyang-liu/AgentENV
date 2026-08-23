@@ -34,7 +34,33 @@ use crate::sandbox::SandboxCaptureError;
 
 /// Default maximum number of overlaybd snapshot layers before compaction triggers.
 /// Well below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
+/// Kept in sync with the `[snapshot] max_stacked_layers` config default.
 const DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS: usize = 32;
+
+/// Compaction trigger policy for persisted overlaybd snapshot chains.
+///
+/// A capture compacts the runtime-owned suffix (plus the newly appended
+/// layer) into a single layer when either trigger fires:
+/// - the total lower count would exceed `max_layers` (guards the LSMT
+///   format's 255-layer hard limit), or
+/// - the suffix holds more than `max_suffix_bytes` of data (bounds the cost
+///   of one compaction, which is limited by the snapshot store's sequential
+///   write bandwidth; 0 disables the size trigger).
+#[derive(Clone, Copy, Debug)]
+struct ChainCompactionPolicy {
+    max_layers: usize,
+    max_suffix_bytes: u64,
+}
+
+impl ChainCompactionPolicy {
+    fn from_global_config() -> Self {
+        let snapshot = &ConfigManager::global_config().snapshot;
+        Self {
+            max_layers: snapshot.max_stacked_layers,
+            max_suffix_bytes: snapshot.max_chain_size_mib.saturating_mul(1024 * 1024),
+        }
+    }
+}
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
 const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
@@ -404,6 +430,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
         compaction_output,
+        ChainCompactionPolicy::from_global_config(),
     )
     .await
 }
@@ -415,16 +442,20 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
+    policy: ChainCompactionPolicy,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
-    // If the total number of lowers exceeds the default maximum, try to compact the
-    // runtime-owned suffix and appended layers into a single layer.
+    // Compact the runtime-owned suffix and appended layer into a single
+    // layer when the layer-count or suffix-size trigger fires.
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > 1
-        && lowers.len() + compactable_count > DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
-    {
+    let over_layers = lowers.len() + compactable_count > policy.max_layers;
+    let over_bytes = !over_layers
+        && policy.max_suffix_bytes > 0
+        && suffix_size_bytes(&runtime_owned_lowers, appended_layer.as_ref()).await
+            > policy.max_suffix_bytes;
+    if compactable_count > 1 && (over_layers || over_bytes) {
         let mut runtime_suffix = runtime_owned_lowers;
         if let Some(layer) = appended_layer {
             runtime_suffix.push(layer);
@@ -463,6 +494,31 @@ async fn rewrite_lowers_with_runtime_roots(
     }
 
     Ok(lowers)
+}
+
+/// Total on-disk bytes of the runtime-owned suffix plus the appended layer.
+///
+/// Lowers without a local file path (remote layers) contribute zero: they
+/// cannot be compacted anyway, and triggering on them would only surface the
+/// existing remote-lowers error earlier. Unreadable files also count as
+/// zero so a stat failure degrades to layer-count-triggered behavior.
+async fn suffix_size_bytes(
+    runtime_owned_lowers: &[LayerConfig],
+    appended_layer: Option<&LayerConfig>,
+) -> u64 {
+    let mut total = 0u64;
+    for lower in runtime_owned_lowers
+        .iter()
+        .chain(appended_layer.into_iter())
+    {
+        if lower.file.is_empty() {
+            continue;
+        }
+        if let Ok(metadata) = tokio::fs::metadata(&lower.file).await {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 async fn capture_live_overlaybd_snapshot(
@@ -967,6 +1023,10 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            ChainCompactionPolicy {
+                max_layers: DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
+                max_suffix_bytes: 0,
+            },
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1041,6 +1101,86 @@ mod tests {
         assert_eq!(PathBuf::from(&latest.file), snapshot_lower);
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
+    }
+
+    #[tokio::test]
+    async fn suffix_size_bytes_sums_local_files_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a.commit");
+        let b = temp.path().join("b.commit");
+        std::fs::write(&a, vec![0u8; 1000]).expect("write a");
+        std::fs::write(&b, vec![0u8; 500]).expect("write b");
+
+        let lowers = vec![
+            local_layer_config(&a),
+            // Remote lower: no local file, must contribute zero.
+            LayerConfig {
+                digest: "sha256:remote".to_string(),
+                size: 4096,
+                ..Default::default()
+            },
+            // Missing file: stat failure degrades to zero.
+            local_layer_config(&temp.path().join("missing.commit")),
+        ];
+        let appended = local_layer_config(&b);
+
+        assert_eq!(suffix_size_bytes(&lowers, Some(&appended)).await, 1500);
+        assert_eq!(suffix_size_bytes(&lowers, None).await, 1000);
+    }
+
+    #[tokio::test]
+    async fn size_trigger_forces_compaction_with_few_layers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifacts_root = temp.path().join("owned");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&artifacts_root).expect("owned root");
+        std::fs::create_dir_all(&output_dir).expect("output dir");
+        let layer_a = artifacts_root.join("a.commit");
+        let layer_b = artifacts_root.join("b.commit");
+        std::fs::write(&layer_a, vec![1u8; 4096]).expect("write a");
+        std::fs::write(&layer_b, vec![2u8; 4096]).expect("write b");
+        let lowers = vec![local_layer_config(&layer_a), local_layer_config(&layer_b)];
+        let runtime_owned_roots = [artifacts_root.canonicalize().unwrap()];
+
+        // Size trigger disabled: two small layers stay under the layer-count
+        // trigger and are adopted as-is.
+        let adopted = rewrite_lowers_with_runtime_roots(
+            lowers.clone(),
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainCompactionPolicy {
+                max_layers: DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
+                max_suffix_bytes: 0,
+            },
+        )
+        .await
+        .expect("adopt path should succeed");
+        assert_eq!(adopted.len(), 2);
+
+        // Size trigger enabled and exceeded: the same two layers take the
+        // compaction path, which fails on these synthetic (non-LSMT) files —
+        // proving the size trigger routed them into the merge.
+        let err = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            ChainCompactionPolicy {
+                max_layers: DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
+                max_suffix_bytes: 1,
+            },
+        )
+        .await
+        .expect_err("size trigger must route into compaction");
+        assert!(
+            !format!("{err:#}").contains("adopt"),
+            "failure should come from the compaction path: {err:#}"
+        );
     }
 
     #[tokio::test]

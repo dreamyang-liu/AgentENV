@@ -338,6 +338,19 @@ pub struct SnapshotConfig {
     /// transport after each commit. Has no effect unless `[p2p].enabled` is also true.
     #[config(default = true)]
     pub p2p_enabled: bool,
+    /// Maximum stacked overlaybd layers a capture keeps in its persisted
+    /// snapshot chain before compacting the runtime-owned suffix into a
+    /// single layer. Applies to both rootfs and memory chains. Clamped to
+    /// [2, 240] to stay under the LSMT format's 255-layer hard limit.
+    #[config(env = "AGENTENV_SNAPSHOT_MAX_STACKED_LAYERS", default = 32)]
+    pub max_stacked_layers: usize,
+    /// Size-based compaction trigger: compact the persisted chain when its
+    /// runtime-owned suffix exceeds this many MiB, regardless of layer count.
+    /// Bounds the cost of a single compaction (merge throughput is limited by
+    /// the snapshot store's sequential write bandwidth). 0 disables the size
+    /// trigger.
+    #[config(env = "AGENTENV_SNAPSHOT_MAX_CHAIN_SIZE_MIB", default = 0)]
+    pub max_chain_size_mib: u64,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
 }
@@ -911,6 +924,11 @@ impl AppConfig {
         if !self.memory_snapshot.track_dirty_pages {
             self.memory_snapshot.incremental_layers = false;
         }
+
+        // Keep the stacked-layer budget inside the LSMT format's 255-layer
+        // hard limit (with headroom for the live stack growing between
+        // captures) and above the smallest meaningful chain.
+        self.snapshot.max_stacked_layers = self.snapshot.max_stacked_layers.clamp(2, 240);
 
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
