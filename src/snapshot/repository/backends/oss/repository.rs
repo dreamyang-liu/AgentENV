@@ -240,30 +240,37 @@ impl SnapshotRepository for OssSnapshotRepository {
             }
             let rootfs_layers = rootfs_outcome.layers;
 
-            let memory_layers = self
-                .derive_and_upload_memory_layers(&manifest.memory.image_config_path)
-                .await?;
+            // Disk-only snapshots have no memory layers and no VM state artifact.
+            let memory_layers = match &manifest.memory {
+                Some(memory) => {
+                    self.derive_and_upload_memory_layers(&memory.image_config_path)
+                        .await?
+                }
+                None => Vec::new(),
+            };
 
             // 2. Upload per-snapshot fixed artifacts.
-            let vm_state_local_path = manifest.vm_state.path.as_path();
-            self.client
-                .put_file(
-                    &layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
-                    vm_state_local_path,
-                    OssUploadArtifact::VmState,
-                )
-                .await
-                .map_err(|e| {
-                    RepositoryError::backend(
-                        format!(
-                            "upload artifact '{}' from '{}' for snapshot '{}'",
-                            SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-                            vm_state_local_path.display(),
-                            id
-                        ),
-                        e,
+            if let Some(vm_state) = &manifest.vm_state {
+                let vm_state_local_path = vm_state.path.as_path();
+                self.client
+                    .put_file(
+                        &layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+                        vm_state_local_path,
+                        OssUploadArtifact::VmState,
                     )
-                })?;
+                    .await
+                    .map_err(|e| {
+                        RepositoryError::backend(
+                            format!(
+                                "upload artifact '{}' from '{}' for snapshot '{}'",
+                                SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+                                vm_state_local_path.display(),
+                                id
+                            ),
+                            e,
+                        )
+                    })?;
+            }
 
             let persisted_manifest_bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|e| RepositoryError::backend("serialize firecracker manifest", e))?;
@@ -1187,15 +1194,17 @@ fn validate_publish_manifest_image_configs(
             e,
         )
     })?;
-    load_overlaybd_image_config(&manifest.memory.image_config_path).map_err(|e| {
-        RepositoryError::backend(
-            format!(
-                "validate memory image config '{}'",
-                manifest.memory.image_config_path.display()
-            ),
-            e,
-        )
-    })?;
+    if let Some(memory) = &manifest.memory {
+        load_overlaybd_image_config(&memory.image_config_path).map_err(|e| {
+            RepositoryError::backend(
+                format!(
+                    "validate memory image config '{}'",
+                    memory.image_config_path.display()
+                ),
+                e,
+            )
+        })?;
+    }
     for drive in &manifest.attached_drives {
         load_overlaybd_image_config(&drive.image_config_path).map_err(|e| {
             RepositoryError::backend(
@@ -1269,7 +1278,11 @@ mod tests {
 
         let mut manifest = FirecrackerSnapshotManifest::for_test(1024, &[]);
         manifest.rootfs.image_config_path = rootfs_image_config;
-        manifest.memory.image_config_path = memory_image_config;
+        manifest
+            .memory
+            .as_mut()
+            .expect("test manifest should carry memory artifacts")
+            .image_config_path = memory_image_config;
 
         let err = validate_publish_manifest_image_configs(&manifest)
             .expect_err("missing memory repoBlobUrl should fail preflight");

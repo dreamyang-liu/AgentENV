@@ -403,6 +403,56 @@ impl FirecrackerSandboxConfig {
         Self::from_app_config_with_user_image(ConfigManager::global_config(), user_image_config)
     }
 
+    /// Builds a fresh-boot config from a resolved committed snapshot's rootfs
+    /// (cold boot): the sandbox boots a new kernel over the snapshot's disk
+    /// state instead of restoring VM state and memory.
+    ///
+    /// Used for disk-only snapshots, which have no VM state to resume. Unlike
+    /// resume, cold boot intentionally performs no virtualization-mode check:
+    /// no VM state crosses the KVM/PVM ABI boundary, so a snapshot captured
+    /// under one mode can cold-boot on a node running the other.
+    pub fn from_runnable_snapshot_cold_boot(
+        config: &AppConfig,
+        snapshot: &RunnableSnapshot,
+        cpu_config_json: Option<String>,
+    ) -> Result<Self> {
+        let manifest = snapshot.manifest();
+        let committed = snapshot.committed();
+
+        let tools_drive_version = &committed.runtime_versions.tools_drive_version;
+        if tools_drive_version.trim().is_empty() {
+            bail!(
+                "snapshot does not record a tools drive version; migrate its metadata before launching it"
+            );
+        }
+
+        let user_image_config = OverlaybdConfig {
+            image_config_path: manifest.rootfs.image_config_path.clone(),
+            read_only: false,
+            runtime_upper_mode: UpperMode::LogStructured,
+        };
+        let mut sandbox_config = Self::from_app_config_with_user_image(config, user_image_config)?;
+
+        sandbox_config.vcpu_count = snapshot.resources().cpu_count;
+        sandbox_config.mem_size_mib = snapshot.resources().memory_mib;
+        // A fresh boot of an already-materialized snapshot rootfs must keep the
+        // captured block-device size; resize semantics only apply to newly
+        // created writable rootfs images.
+        sandbox_config.common.rootfs_virtual_size = Some(manifest.rootfs.virtual_size);
+        sandbox_config.common.extra_drives = manifest.extra_drives();
+        sandbox_config.common.tools_drive_version = tools_drive_version.clone();
+        sandbox_config.common.envd_version = committed.runtime_versions.envd_version.clone();
+        sandbox_config.common.cpu_config_json = cpu_config_json;
+
+        let build_context = &committed.context;
+        let env_vars = build_context.env_vars.clone();
+        sandbox_config.common.env_vars = (!env_vars.is_empty()).then_some(env_vars);
+        sandbox_config.common.default_workdir = Some(build_context.workdir.clone());
+        sandbox_config.common.default_user = build_context.user.clone();
+
+        Ok(sandbox_config)
+    }
+
     pub fn apply_launch_config(mut self, launch_config: &SandboxLaunchConfig) -> Self {
         if let Some(env_vars) = launch_config
             .env_vars
@@ -519,17 +569,29 @@ impl FirecrackerSnapshotConfig {
             ..base_common
         };
 
+        let memory = manifest.memory.as_ref().with_context(|| {
+            format!(
+                "snapshot '{}' is disk-only (no memory snapshot) and cannot be resumed; it can only boot fresh",
+                snapshot.record().id
+            )
+        })?;
+        let vm_state = manifest.vm_state.as_ref().with_context(|| {
+            format!(
+                "snapshot '{}' has no VM state artifact and cannot be resumed; it can only boot fresh",
+                snapshot.record().id
+            )
+        })?;
         let mem_overlaybd_config = OverlaybdConfig {
-            image_config_path: manifest.memory.image_config_path.clone(),
+            image_config_path: memory.image_config_path.clone(),
             read_only: true,
             runtime_upper_mode: UpperMode::LogStructured,
         };
 
         Ok(Self {
             common: snapshot_common,
-            vm_state_path: manifest.vm_state.path.clone(),
+            vm_state_path: vm_state.path.clone(),
             mem_overlaybd_config,
-            mem_virtual_size: manifest.memory.virtual_size,
+            mem_virtual_size: memory.virtual_size,
             managed_snapshot_root: None,
         })
     }
@@ -929,5 +991,128 @@ mod tests {
         assert!(err
             .to_string()
             .contains(&format!("uses virtualization mode '{snapshot_mode}'")));
+    }
+
+    fn disk_only_runnable_snapshot() -> crate::snapshot::RunnableSnapshot {
+        use crate::sandbox::firecracker::manifest::FirecrackerSnapshotManifest;
+        use crate::types::SandboxResources;
+
+        let mut committed = CommittedSnapshot::mock();
+        committed.context.workdir = "/workspace".to_string();
+        committed.context.user = Some("agent".to_string());
+        committed
+            .context
+            .env_vars
+            .insert("SNAPSHOT_ENV".to_string(), "1".to_string());
+        let mut record = SnapshotRecord::mock_ready(committed);
+        record.resources = SandboxResources {
+            cpu_count: 3,
+            memory_mib: 768,
+            disk_size_mib: 0,
+        };
+        let manifest = FirecrackerSnapshotManifest::new_disk_only("rootfs/image.json", 8192, &[])
+            .expect("disk-only manifest should build");
+        RunnableSnapshot::from_test_parts(record, manifest)
+    }
+
+    #[test]
+    fn disk_only_snapshot_cannot_be_resumed() {
+        let snapshot = disk_only_runnable_snapshot();
+
+        let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
+            .expect_err("disk-only snapshot must not build a resume config");
+
+        assert!(err.to_string().contains("disk-only"));
+    }
+
+    #[test]
+    fn cold_boot_config_uses_snapshot_rootfs_resources_and_context() -> Result<()> {
+        let snapshot = disk_only_runnable_snapshot();
+
+        let config = FirecrackerSandboxConfig::from_runnable_snapshot_cold_boot(
+            &base_app_config(),
+            &snapshot,
+            Some("{\"cpu\":\"template\"}".to_string()),
+        )?;
+
+        assert_eq!(config.vcpu_count, 3);
+        assert_eq!(config.mem_size_mib, 768);
+        assert_eq!(config.common.rootfs_virtual_size, Some(8192));
+        assert_eq!(
+            config
+                .common
+                .rootfs_image_config
+                .as_ref()
+                .map(|rootfs| rootfs.image_config_path.clone()),
+            Some(PathBuf::from("rootfs/image.json"))
+        );
+        assert_eq!(config.common.tools_drive_version, "0.1.0");
+        assert_eq!(config.common.envd_version, "envd");
+        assert_eq!(config.common.default_workdir.as_deref(), Some("/workspace"));
+        assert_eq!(config.common.default_user.as_deref(), Some("agent"));
+        assert_eq!(
+            config
+                .common
+                .env_vars
+                .as_ref()
+                .and_then(|env| env.get("SNAPSHOT_ENV"))
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            config.common.cpu_config_json.as_deref(),
+            Some("{\"cpu\":\"template\"}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cold_boot_config_accepts_cross_virtualization_mode() -> Result<()> {
+        use crate::sandbox::firecracker::manifest::FirecrackerSnapshotManifest;
+        use crate::virtualization::VirtualizationMode;
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let other_mode = match node_mode {
+            VirtualizationMode::Kvm => VirtualizationMode::Pvm,
+            VirtualizationMode::Pvm => VirtualizationMode::Kvm,
+        };
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = other_mode;
+        let record = SnapshotRecord::mock_ready(committed);
+        let manifest = FirecrackerSnapshotManifest::new_disk_only("rootfs/image.json", 4096, &[])
+            .expect("disk-only manifest should build");
+        let snapshot = RunnableSnapshot::from_test_parts(record, manifest);
+
+        // No VM state crosses the ABI on a fresh boot, so the capture-time
+        // mode must not block cold boot.
+        FirecrackerSandboxConfig::from_runnable_snapshot_cold_boot(
+            &base_app_config(),
+            &snapshot,
+            None,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn cold_boot_config_requires_tools_drive_version() {
+        use crate::sandbox::firecracker::manifest::FirecrackerSnapshotManifest;
+
+        let mut committed = CommittedSnapshot::mock();
+        committed.runtime_versions.tools_drive_version.clear();
+        let record = SnapshotRecord::mock_ready(committed);
+        let manifest = FirecrackerSnapshotManifest::new_disk_only("rootfs/image.json", 4096, &[])
+            .expect("disk-only manifest should build");
+        let snapshot = RunnableSnapshot::from_test_parts(record, manifest);
+
+        let err = FirecrackerSandboxConfig::from_runnable_snapshot_cold_boot(
+            &base_app_config(),
+            &snapshot,
+            None,
+        )
+        .expect_err("cold boot must require a recorded tools drive version");
+
+        assert!(err
+            .to_string()
+            .contains("does not record a tools drive version"));
     }
 }

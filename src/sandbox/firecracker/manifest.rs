@@ -19,8 +19,13 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub struct FirecrackerSnapshotManifest {
     /// Schema/version marker for persisted manifest format.
     pub version: u32,
-    pub vm_state: FirecrackerVmStateArtifacts,
-    pub memory: FirecrackerMemoryArtifacts,
+    /// Firecracker VM state artifact. `None` for disk-only snapshots, which
+    /// carry no resumable VM state and can only boot fresh from their rootfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_state: Option<FirecrackerVmStateArtifacts>,
+    /// Memory snapshot artifacts. `None` for disk-only snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<FirecrackerMemoryArtifacts>,
     pub rootfs: FirecrackerRootfsArtifacts,
     pub attached_drives: Vec<FirecrackerAttachedDriveArtifacts>,
 }
@@ -73,13 +78,13 @@ impl FirecrackerSnapshotManifest {
     ) -> Result<Self> {
         Self {
             version: MANIFEST_FORMAT_VERSION,
-            vm_state: FirecrackerVmStateArtifacts {
+            vm_state: Some(FirecrackerVmStateArtifacts {
                 path: vm_state_path.into(),
-            },
-            memory: FirecrackerMemoryArtifacts {
+            }),
+            memory: Some(FirecrackerMemoryArtifacts {
                 image_config_path: mem_image_config_path.into(),
                 virtual_size: mem_virtual_size,
-            },
+            }),
             rootfs: FirecrackerRootfsArtifacts {
                 image_config_path: rootfs_image_config_path.into(),
                 virtual_size: rootfs_virtual_size,
@@ -87,6 +92,34 @@ impl FirecrackerSnapshotManifest {
             attached_drives: Vec::new(),
         }
         .with_extra_drives(attached_drives)
+    }
+
+    /// Builds a manifest for a disk-only snapshot: rootfs and attached-drive
+    /// state without VM state or memory artifacts. Such snapshots cannot be
+    /// resumed; sandboxes launch from them via a fresh (cold) boot.
+    pub fn new_disk_only(
+        rootfs_image_config_path: impl Into<PathBuf>,
+        rootfs_virtual_size: u64,
+        attached_drives: &[ExtraDrive],
+    ) -> Result<Self> {
+        Self {
+            version: MANIFEST_FORMAT_VERSION,
+            vm_state: None,
+            memory: None,
+            rootfs: FirecrackerRootfsArtifacts {
+                image_config_path: rootfs_image_config_path.into(),
+                virtual_size: rootfs_virtual_size,
+            },
+            attached_drives: Vec::new(),
+        }
+        .with_extra_drives(attached_drives)
+    }
+
+    /// Whether this snapshot carries resumable VM state (Firecracker vm_state
+    /// plus a memory image). Disk-only snapshots return `false` and can only
+    /// cold-boot.
+    pub fn has_memory_state(&self) -> bool {
+        self.vm_state.is_some() && self.memory.is_some()
     }
 
     pub fn extra_drives(&self) -> Vec<ExtraDrive> {
@@ -197,13 +230,13 @@ mod tests {
 
         let manifest = FirecrackerSnapshotManifest {
             version: MANIFEST_FORMAT_VERSION,
-            vm_state: FirecrackerVmStateArtifacts {
+            vm_state: Some(FirecrackerVmStateArtifacts {
                 path: PathBuf::from("vm_state.bin"),
-            },
-            memory: FirecrackerMemoryArtifacts {
+            }),
+            memory: Some(FirecrackerMemoryArtifacts {
                 image_config_path: PathBuf::from("mem_image.json"),
                 virtual_size: 4096,
-            },
+            }),
             rootfs: FirecrackerRootfsArtifacts {
                 image_config_path: PathBuf::from("rootfs/image.json"),
                 virtual_size: 4096,
@@ -213,6 +246,64 @@ mod tests {
 
         let drives = manifest.extra_drives();
         assert_eq!(drives[0].virtual_size(), Some(4096));
+    }
+
+    #[test]
+    fn full_manifest_round_trips_and_reports_memory_state() {
+        let manifest = FirecrackerSnapshotManifest::new(
+            "vm_state.bin",
+            "mem_image.json",
+            4096,
+            "rootfs/image.json",
+            4096,
+            &[],
+        )
+        .expect("full manifest should build");
+        assert!(manifest.has_memory_state());
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("vmState").is_some());
+        assert_eq!(json["memory"]["virtualSize"], serde_json::json!(4096));
+
+        let parsed: FirecrackerSnapshotManifest = serde_json::from_value(json).unwrap();
+        assert!(parsed.has_memory_state());
+    }
+
+    #[test]
+    fn disk_only_manifest_omits_vm_state_and_memory() {
+        let manifest = FirecrackerSnapshotManifest::new_disk_only("rootfs/image.json", 4096, &[])
+            .expect("disk-only manifest should build");
+        assert!(!manifest.has_memory_state());
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("vmState").is_none());
+        assert!(json.get("memory").is_none());
+
+        let parsed: FirecrackerSnapshotManifest = serde_json::from_value(json).unwrap();
+        assert!(parsed.vm_state.is_none());
+        assert!(parsed.memory.is_none());
+        assert!(!parsed.has_memory_state());
+    }
+
+    #[test]
+    fn legacy_manifest_json_with_memory_fields_parses_as_full() {
+        // Shape produced by the pre-Option manifest format: `vmState` always
+        // serialized as an empty object (its path is #[serde(skip)]) and
+        // `memory` with only `virtualSize`.
+        let parsed: FirecrackerSnapshotManifest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "vmState": {},
+            "memory": { "virtualSize": 1024 },
+            "rootfs": { "virtualSize": 2048 },
+            "attachedDrives": []
+        }))
+        .expect("legacy manifest should parse");
+
+        assert!(parsed.has_memory_state());
+        assert_eq!(
+            parsed.memory.as_ref().map(|memory| memory.virtual_size),
+            Some(1024)
+        );
     }
 
     #[test]

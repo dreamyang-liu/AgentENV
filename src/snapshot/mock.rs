@@ -146,3 +146,37 @@ pub fn write_mock_built_artifacts(
 
     Ok((rootfs_lower, memory_lower, manifest))
 }
+
+/// Writes a minimal disk-only exported snapshot artifact set: a rootfs layer
+/// and image config, without VM state or memory artifacts.
+pub fn write_mock_built_artifacts_disk_only(
+    root: &Path,
+) -> Result<(PathBuf, FirecrackerSnapshotManifest)> {
+    std::fs::create_dir_all(root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir))?;
+
+    let rootfs_lower = root.join("base.overlaybd.commit");
+    std::fs::write(&rootfs_lower, b"base-layer")?;
+    let rootfs_descriptor = crate::digest::FileDigest::describe_blocking(&rootfs_lower)?;
+    std::fs::write(
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
+        format!(
+            r#"{{
+  "repoBlobUrl": "",
+  "lowers": [{{ "file": "{}", "digest": "{}", "size": {} }}],
+  "upper": {{}},
+  "resultFile": ""
+}}"#,
+            rootfs_lower.display(),
+            rootfs_descriptor.sha256,
+            rootfs_descriptor.size
+        ),
+    )?;
+
+    let manifest = FirecrackerSnapshotManifest::new_disk_only(
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
+        32768,
+        &Vec::new(),
+    )?;
+
+    Ok((rootfs_lower, manifest))
+}

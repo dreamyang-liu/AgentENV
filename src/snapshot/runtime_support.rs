@@ -133,8 +133,8 @@ pub(crate) async fn load_firecracker_manifest_from_path(
 
 pub(crate) fn hydrate_runtime_manifest(
     mut manifest: FirecrackerSnapshotManifest,
-    vm_state_path: PathBuf,
-    memory_image_config_path: PathBuf,
+    vm_state_path: Option<PathBuf>,
+    memory_image_config_path: Option<PathBuf>,
     rootfs_image_config_path: PathBuf,
     attached_drives: &[ResolvedAttachedDrive],
 ) -> RepositoryResult<FirecrackerSnapshotManifest> {
@@ -147,8 +147,18 @@ pub(crate) fn hydrate_runtime_manifest(
             reason: format!("hydrate attached drives in firecracker manifest: {error:#}"),
         }
     })?;
-    manifest.vm_state.path = vm_state_path;
-    manifest.memory.image_config_path = memory_image_config_path;
+    if let Some(vm_state) = manifest.vm_state.as_mut() {
+        vm_state.path = vm_state_path.ok_or_else(|| RepositoryError::InvalidRequest {
+            reason: "manifest records VM state but no local vm_state path was resolved".to_string(),
+        })?;
+    }
+    if let Some(memory) = manifest.memory.as_mut() {
+        memory.image_config_path =
+            memory_image_config_path.ok_or_else(|| RepositoryError::InvalidRequest {
+                reason: "manifest records a memory snapshot but no local memory image config was resolved"
+                    .to_string(),
+            })?;
+    }
     manifest.rootfs.image_config_path = rootfs_image_config_path;
     Ok(manifest)
 }

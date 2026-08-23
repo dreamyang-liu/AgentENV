@@ -27,6 +27,40 @@ Recoverable failures leave the sandbox running and surface the error to the
 caller. Terminal failures — where the runtime was mutated past safe resume —
 tear down the sandbox.
 
+### Disk-Only Snapshots
+
+By default a snapshot captures the full runtime: rootfs deltas, attached-drive
+deltas, the Firecracker VM state, and a memory image. The memory image is by
+far the dominant storage cost — it accumulates every guest page dirtied since
+launch (including page cache) and is not deduplicated across snapshots of the
+same sandbox. Workflows that snapshot the same sandbox many times (for
+example, checkpointing an agent trajectory at every mutating step) can skip it:
+
+```bash
+aenv snapshot create <sandbox-id> --name step-42 --disk-only
+```
+
+or `POST /sandboxes/{sandboxID}/snapshots` with `{"diskOnly": true}`.
+
+A disk-only snapshot stores only the rootfs and attached-drive layers — the
+incremental cost is roughly the bytes written since the previous snapshot.
+Before capture, AgentENV runs `sync` inside the guest so page-cache writes
+reach the virtual disk. The trade-offs:
+
+- **No resume.** The snapshot has no VM state or memory image. Creating a
+  sandbox from it **cold-boots** a fresh kernel over the captured disk state
+  instead of resuming (`POST /sandboxes` with the snapshot as `templateID`
+  works transparently; the server picks the boot mode from the snapshot).
+- **Processes are not restored.** The snapshot's startup command
+  (`start_cmd`/`ready_cmd`, inherited from its template) is re-run once the
+  guest is ready, like a machine that rebooted. Other processes that were
+  running at capture time are gone.
+- **tmpfs contents are lost** (they live in memory), along with any state that
+  never reached the disk.
+- **Cross-ABI launch is allowed.** A fresh boot restores no VM state, so a
+  disk-only snapshot captured on a KVM node can boot on a PVM node and vice
+  versa; the capture-time virtualization mode does not constrain placement.
+
 ## OverlayBD Image Publication
 
 When the snapshot repository backend is `oss` and `[snapshot.image_publish]` is

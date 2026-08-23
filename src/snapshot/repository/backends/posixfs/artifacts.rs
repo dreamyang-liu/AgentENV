@@ -48,15 +48,21 @@ impl PosixFsArtifactStore {
     ) -> RepositoryResult<CollectedBuiltArtifacts> {
         let committed_layout = self.committed_layout(snapshot_id);
 
-        self.copy_local_artifact(
-            committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
-            &manifest.vm_state.path,
-        )?;
+        // Disk-only snapshots have no VM state artifact and no memory layers.
+        if let Some(vm_state) = &manifest.vm_state {
+            self.copy_local_artifact(
+                committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+                &vm_state.path,
+            )?;
+        }
         self.persist_firecracker_manifest(
             committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
             manifest,
         )?;
-        let memory_layers = self.derive_memory_layers(&manifest.memory.image_config_path)?;
+        let memory_layers = match &manifest.memory {
+            Some(memory) => self.derive_memory_layers(&memory.image_config_path)?,
+            None => Vec::new(),
+        };
 
         let attached_drives = manifest
             .attached_drives
@@ -899,7 +905,11 @@ mod tests {
 
         let committed_layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
         assert_same_inode(
-            &manifest.vm_state.path,
+            &manifest
+                .vm_state
+                .as_ref()
+                .expect("test manifest should carry vm state")
+                .path,
             &committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         );
 
@@ -1067,7 +1077,11 @@ mod tests {
         let zfile_descriptor =
             FileDigest::describe_blocking(&zfile_lower).expect("describe zfile lower");
         fs::write(
-            &manifest.memory.image_config_path,
+            &manifest
+                .memory
+                .as_ref()
+                .expect("test manifest should carry memory artifacts")
+                .image_config_path,
             format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, zfile_lower.display()),
         )
         .expect("write zfile memory image config");

@@ -462,8 +462,20 @@ mod tests {
             .await
             .expect("resolve should work");
         assert!(runnable.manifest().rootfs.image_config_path.exists());
-        assert!(runnable.manifest().vm_state.path.exists());
-        assert!(runnable.manifest().memory.image_config_path.exists());
+        assert!(runnable
+            .manifest()
+            .vm_state
+            .as_ref()
+            .expect("full snapshot should carry vm state")
+            .path
+            .exists());
+        assert!(runnable
+            .manifest()
+            .memory
+            .as_ref()
+            .expect("full snapshot should carry memory artifacts")
+            .image_config_path
+            .exists());
 
         let image_config: OverlaybdImageConfig = serde_json::from_slice(
             &std::fs::read(runnable.manifest().rootfs.image_config_path.as_path())
@@ -472,6 +484,50 @@ mod tests {
         .expect("parse overlaybd image config");
         assert_eq!(image_config.repo_blob_url, "");
         assert_eq!(image_config.lowers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publishes_and_resolves_disk_only_snapshot() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let backend = test_backend(tempdir.path());
+        let repository = backend.repository();
+        let resolver = backend.runtime_resolver();
+        let snapshot_id = SnapshotId::generate();
+        let local_root = tempdir
+            .path()
+            .join("local")
+            .join(uuid::Uuid::now_v7().to_string());
+        let (_, manifest) =
+            crate::snapshot::mock::write_mock_built_artifacts_disk_only(&local_root)
+                .expect("mock disk-only artifacts should write");
+        let metadata = sample_metadata(snapshot_id.clone(), Some("disk-only"));
+
+        let stored = repository
+            .publish(metadata, manifest)
+            .await
+            .expect("disk-only publish should work");
+
+        let committed = stored.committed.as_ref().expect("snapshot is committed");
+        assert!(committed.memory_layers.is_empty());
+        assert_eq!(committed.rootfs_layers.len(), 1);
+        let repo_vm_state = tempdir
+            .path()
+            .join("snapshots")
+            .join(snapshot_id.to_string())
+            .join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        assert!(
+            !repo_vm_state.exists(),
+            "disk-only snapshot must not store a vm state artifact"
+        );
+
+        let runnable = resolver
+            .resolve(Arc::new(stored))
+            .await
+            .expect("disk-only resolve should work");
+        assert!(runnable.manifest().vm_state.is_none());
+        assert!(runnable.manifest().memory.is_none());
+        assert!(!runnable.manifest().has_memory_state());
+        assert!(runnable.manifest().rootfs.image_config_path.exists());
     }
 
     #[tokio::test]

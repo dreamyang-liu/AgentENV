@@ -11,6 +11,7 @@ use tracing::{debug, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
+use super::cold_start;
 use super::config::{
     create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
     FirecrackerSandboxConfig, FirecrackerSnapshotConfig, PersistentSnapshotRootGuard,
@@ -33,7 +34,7 @@ use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
     SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    SandboxRuntimeInfo, SnapshotCaptureOptions,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -41,7 +42,7 @@ use crate::sandbox::extra_drive::{
     USER_ROOTFS_DRIVE_ID,
 };
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
-use crate::sandbox::process::Executor;
+use crate::sandbox::process::{Executor, ProcessOpts};
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
     UblkCreateSpec, UblkDeviceManager,
@@ -187,6 +188,11 @@ pub struct FirecrackerSandbox {
     rootfs_image_config_path: Option<PathBuf>,
     extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
     current_rootfs_virtual_size: Option<u64>,
+    /// Startup command to run once after a cold boot from a disk-only
+    /// snapshot. Resume restores the processes captured in the memory image,
+    /// but a fresh boot must re-launch the snapshot's services. Consumed
+    /// (taken) by the first [`FirecrackerSandbox::wait_for_ready`].
+    cold_boot_startup: std::sync::Mutex<Option<crate::snapshot::StartupCommand>>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
     /// Delivers the custom extension stop hook exactly once: `stop()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
@@ -304,14 +310,25 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
     }
 
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    async fn snapshot(
+        &mut self,
+        options: SnapshotCaptureOptions,
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+        if options.disk_only {
+            // Disk-only snapshots capture only blocks that reached the virtual
+            // disk. Flush guest filesystem buffers while the VM is still
+            // running so recent writes are not lost to the guest page cache.
+            self.sync_guest_disks()
+                .await
+                .map_err(SandboxCaptureError::from)?;
+        }
         let live_snapshot_root = self
             .live_snapshot_root()
             .await
             .map_err(SandboxCaptureError::from)?;
         let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
+        let (_, manifest) = match self.capture_to_dir(&snapshot_dir, options.disk_only).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let snapshot_err = SandboxCaptureError::from(err);
@@ -523,18 +540,67 @@ impl FirecrackerSandbox {
 
     /// Create a sandbox handle that boots from a resolved runnable committed snapshot.
     ///
+    /// Full snapshots resume their captured VM state; disk-only snapshots
+    /// cold-boot a fresh kernel over the captured rootfs and re-run the
+    /// snapshot's startup command once the guest is ready.
+    ///
     /// This only prepares the sandbox object and its per-instance workspace.
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
     pub fn from_snapshot(
         snapshot: &RunnableSnapshot,
         launch_config: &SandboxLaunchConfig,
     ) -> Result<Self> {
-        let snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
+        Self::from_snapshot_with_cpu_config(snapshot, launch_config, None)
+    }
 
-        Self::build(
-            launch_config.sandbox_id,
-            LaunchMode::Resume(snapshot_config),
-        )
+    /// [`FirecrackerSandbox::from_snapshot`] with an explicit cluster CPU
+    /// config for the cold-boot path. Resume ignores it: the CPU state is
+    /// already serialized inside the snapshot's VM state.
+    pub(crate) fn from_snapshot_with_cpu_config(
+        snapshot: &RunnableSnapshot,
+        launch_config: &SandboxLaunchConfig,
+        cold_boot_cpu_config_json: Option<String>,
+    ) -> Result<Self> {
+        if snapshot.manifest().has_memory_state() {
+            let snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
+
+            return Self::build(
+                launch_config.sandbox_id,
+                LaunchMode::Resume(snapshot_config),
+            );
+        }
+
+        // Disk-only snapshot: fresh boot from the captured rootfs.
+        let config = FirecrackerSandboxConfig::from_runnable_snapshot_cold_boot(
+            ConfigManager::global_config(),
+            snapshot,
+            cold_boot_cpu_config_json,
+        )?;
+        let mut config = config.apply_launch_config(launch_config);
+        // Launch-provided custom config overrides the value persisted in the
+        // source snapshot; otherwise inherit the snapshot's (same rule as the
+        // resume path).
+        if launch_config.custom_extension_params.is_none() {
+            config.common.custom_extension_params =
+                snapshot.committed().custom_extension_params.clone();
+        }
+        debug!(
+            snapshot_id = %snapshot.record().id,
+            rootfs_path = %config
+                .common
+                .rootfs_image_config
+                .as_ref()
+                .map(|rootfs| rootfs.image_config_path.display().to_string())
+                .unwrap_or_default(),
+            "creating firecracker sandbox by cold-booting a disk-only snapshot"
+        );
+        let mut sandbox = Self::build(launch_config.sandbox_id, LaunchMode::Fresh(config))?;
+        *sandbox
+            .cold_boot_startup
+            .get_mut()
+            .expect("cold boot startup lock poisoned") =
+            cold_start::normalize_startup(snapshot.committed().startup.clone());
+        Ok(sandbox)
     }
 
     fn snapshot_config_for_launch(
@@ -625,7 +691,28 @@ impl FirecrackerSandbox {
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
             )
+            .await?;
+
+        // Cold boot from a committed snapshot: the processes captured in the
+        // snapshot's memory image are not restored, so re-run the snapshot's
+        // startup command exactly once now that the guest is ready.
+        let pending_startup = self
+            .cold_boot_startup
+            .lock()
+            .expect("cold boot startup lock poisoned")
+            .take();
+        if let Some(startup) = pending_startup {
+            let connect = envd_instance.process_client_detached();
+            crate::sandbox::process::run_detached("aenv-cold-boot-startup", move || async move {
+                let process_client = connect
+                    .await
+                    .context("connect envd process client for cold-boot startup")?;
+                cold_start::run_startup_commands(process_client, &startup).await
+            })
             .await
+            .context("run snapshot startup command after cold boot")?;
+        }
+        Ok(())
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -661,14 +748,33 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
-        debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        let (snapshot, manifest) = self.capture_to_dir(snapshot_dir, false).await?;
+        let snapshot =
+            snapshot.context("full snapshot capture must produce a resumable snapshot config")?;
+        Ok((snapshot, manifest))
+    }
+
+    /// Pause the running sandbox and persist snapshot artifacts into a
+    /// caller-managed directory. With `disk_only`, only rootfs and
+    /// attached-drive state is captured (no VM state / memory artifacts) and
+    /// no resumable [`FirecrackerSnapshotConfig`] is produced.
+    #[tracing::instrument(skip(self, snapshot_dir))]
+    async fn capture_to_dir(
+        &mut self,
+        snapshot_dir: &Path,
+        disk_only: bool,
+    ) -> Result<(
+        Option<FirecrackerSnapshotConfig>,
+        FirecrackerSnapshotManifest,
+    )> {
+        debug!(snapshot_dir = %snapshot_dir.display(), disk_only, "pausing sandbox");
         self.fc_instance.pause().await?;
 
         tokio::fs::create_dir_all(snapshot_dir)
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let snapshot_result = self.snapshot_to_dir(snapshot_dir, disk_only).await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
@@ -681,49 +787,58 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
-    ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
-        let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
-            &ConfigManager::global_config().memory_snapshot,
-        );
-        let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
-            .await?;
+        disk_only: bool,
+    ) -> Result<(
+        Option<FirecrackerSnapshotConfig>,
+        FirecrackerSnapshotManifest,
+    )> {
+        let memory_artifacts = if disk_only {
+            None
+        } else {
+            let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
+            let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
+                &ConfigManager::global_config().memory_snapshot,
+            );
+            let (mem_layer_path, mem_virtual_size) = self
+                .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
+                .await?;
 
-        // Build the memory image config: collect parent layers, make runtime
-        // lowers local to this snapshot dir, and compact only if the layer
-        // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
-            LaunchMode::Resume(config) => {
-                Some(config.mem_overlaybd_config.image_config_path.as_path())
-            }
-            LaunchMode::Fresh(_) => None,
-        };
-        let mem_image_config = build_mem_snapshot_image_config(
-            resume_mem_image_config_path,
-            &mem_layer_path,
-            snapshot_dir,
-            memory_output,
-        )
-        .await?;
-        let mem_image_config_path = snapshot_dir.join("mem_image.json");
-        tokio::fs::write(
-            &mem_image_config_path,
-            serde_json::to_vec_pretty(&mem_image_config)
-                .context("serialize mem image config for persistent dir")?,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "write mem image config to {}",
-                mem_image_config_path.display()
+            // Build the memory image config: collect parent layers, make runtime
+            // lowers local to this snapshot dir, and compact only if the layer
+            // count exceeds the configured maximum.
+            let resume_mem_image_config_path = match &self.launch {
+                LaunchMode::Resume(config) => {
+                    Some(config.mem_overlaybd_config.image_config_path.as_path())
+                }
+                LaunchMode::Fresh(_) => None,
+            };
+            let mem_image_config = build_mem_snapshot_image_config(
+                resume_mem_image_config_path,
+                &mem_layer_path,
+                snapshot_dir,
+                memory_output,
             )
-        })?;
+            .await?;
+            let mem_image_config_path = snapshot_dir.join("mem_image.json");
+            tokio::fs::write(
+                &mem_image_config_path,
+                serde_json::to_vec_pretty(&mem_image_config)
+                    .context("serialize mem image config for persistent dir")?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "write mem image config to {}",
+                    mem_image_config_path.display()
+                )
+            })?;
 
-        let mem_overlaybd_config = OverlaybdConfig {
-            image_config_path: mem_image_config_path,
-            read_only: true,
-            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            let mem_overlaybd_config = OverlaybdConfig {
+                image_config_path: mem_image_config_path,
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            };
+            Some((vm_state_path, mem_overlaybd_config, mem_virtual_size))
         };
 
         let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
@@ -766,58 +881,106 @@ impl FirecrackerSandbox {
             .snapshot_extra_drives(snapshot_dir)
             .await
             .context("snapshot extra drives to persistent dir")?;
-        let mut snapshot_common = self.launch.common().clone();
-        snapshot_common.network_policy = self.current_network_policy.clone();
-        snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
-        snapshot_common.extra_drives = snapshot_extra_drives.clone();
-        let mut rootfs_read_only = false;
 
-        // Rewrite the overlaybd backend's image config path to point at the snapshot's rootfs.
-        // So that the resumed ublk device uses the captured rootfs layers instead of the original ones.
-        if let Some(ublk_config) = snapshot_common.ublk_config.as_mut() {
-            let UblkBackend::Overlaybd(source) = &mut ublk_config.backend;
-            rootfs_read_only = source.read_only;
-            source.image_config_path = base_rootfs_path.clone();
+        let manifest = match &memory_artifacts {
+            Some((vm_state_path, mem_overlaybd_config, mem_virtual_size)) => {
+                FirecrackerSnapshotManifest::new(
+                    vm_state_path.clone(),
+                    mem_overlaybd_config.image_config_path.clone(),
+                    *mem_virtual_size,
+                    base_rootfs_path.clone(),
+                    rootfs_virtual_size,
+                    &snapshot_extra_drives,
+                )
+            }
+            None => FirecrackerSnapshotManifest::new_disk_only(
+                base_rootfs_path.clone(),
+                rootfs_virtual_size,
+                &snapshot_extra_drives,
+            ),
         }
-        let runtime_upper_mode = snapshot_common
-            .ublk_config
-            .as_ref()
-            .map(|config| match &config.backend {
-                UblkBackend::Overlaybd(source) => source.runtime_upper_mode,
-            })
-            .unwrap_or(overlaybd::config::UpperMode::LogStructured);
-        snapshot_common.rootfs_image_config = Some(OverlaybdConfig {
-            image_config_path: base_rootfs_path.clone(),
-            read_only: rootfs_read_only,
-            runtime_upper_mode,
-        });
-        snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
-
-        let manifest = FirecrackerSnapshotManifest::new(
-            vm_state_path.clone(),
-            mem_overlaybd_config.image_config_path.clone(),
-            mem_virtual_size,
-            base_rootfs_path,
-            rootfs_virtual_size,
-            &snapshot_extra_drives,
-        )
         .context("build firecracker snapshot manifest")?;
 
-        let snapshot = FirecrackerSnapshotConfig {
-            common: snapshot_common,
-            vm_state_path,
-            mem_overlaybd_config,
-            mem_virtual_size,
-            managed_snapshot_root: None,
+        let snapshot = match memory_artifacts {
+            Some((vm_state_path, mem_overlaybd_config, mem_virtual_size)) => {
+                let mut snapshot_common = self.launch.common().clone();
+                snapshot_common.network_policy = self.current_network_policy.clone();
+                snapshot_common.custom_extension_params =
+                    self.current_custom_extension_params.clone();
+                snapshot_common.extra_drives = snapshot_extra_drives.clone();
+                let mut rootfs_read_only = false;
+
+                // Rewrite the overlaybd backend's image config path to point at the snapshot's rootfs.
+                // So that the resumed ublk device uses the captured rootfs layers instead of the original ones.
+                if let Some(ublk_config) = snapshot_common.ublk_config.as_mut() {
+                    let UblkBackend::Overlaybd(source) = &mut ublk_config.backend;
+                    rootfs_read_only = source.read_only;
+                    source.image_config_path = base_rootfs_path.clone();
+                }
+                let runtime_upper_mode = snapshot_common
+                    .ublk_config
+                    .as_ref()
+                    .map(|config| match &config.backend {
+                        UblkBackend::Overlaybd(source) => source.runtime_upper_mode,
+                    })
+                    .unwrap_or(overlaybd::config::UpperMode::LogStructured);
+                snapshot_common.rootfs_image_config = Some(OverlaybdConfig {
+                    image_config_path: base_rootfs_path.clone(),
+                    read_only: rootfs_read_only,
+                    runtime_upper_mode,
+                });
+                snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
+
+                Some(FirecrackerSnapshotConfig {
+                    common: snapshot_common,
+                    vm_state_path,
+                    mem_overlaybd_config,
+                    mem_virtual_size,
+                    managed_snapshot_root: None,
+                })
+            }
+            None => None,
         };
 
         debug!(
-            vm_state_path = %snapshot.vm_state_path.display(),
-            mem_image_config_path = %snapshot.mem_overlaybd_config.image_config_path.display(),
-            rootfs_path = ?snapshot.common.rootfs_image_config.as_ref().map(|rootfs| &rootfs.image_config_path),
+            disk_only,
+            rootfs_path = %base_rootfs_path.display(),
             "persistent snapshot created"
         );
         Ok((snapshot, manifest))
+    }
+
+    /// Flush guest filesystem buffers to the virtual disks.
+    ///
+    /// Disk-only snapshots capture only blocks that reached the block device;
+    /// without a guest-side sync, recently written files may still sit in the
+    /// guest page cache and would be missing from the captured rootfs.
+    async fn sync_guest_disks(&self) -> Result<()> {
+        let envd_instance = self
+            .envd_instance
+            .as_ref()
+            .context("sandbox has no envd connection for guest sync")?;
+        let connect = envd_instance.process_client_detached();
+        let output = crate::sandbox::process::run_detached("aenv-guest-sync", move || async move {
+            let process_client = connect
+                .await
+                .context("connect envd process client for guest sync")?;
+            crate::sandbox::process::run_command_with_client(
+                process_client,
+                "sync".to_string(),
+                Vec::new(),
+                ProcessOpts::default(),
+            )
+            .await
+        })
+        .await
+        .context("run guest sync before disk-only snapshot")?;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "guest sync exited with status {} before disk-only snapshot",
+            output.exit_code
+        );
+        Ok(())
     }
 
     async fn snapshot_memory_to_overlaybd(
@@ -1183,6 +1346,7 @@ impl FirecrackerSandbox {
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
+            cold_boot_startup: std::sync::Mutex::new(None),
             live_snapshot_root: None,
             custom_extension_hook_guard: None,
         })

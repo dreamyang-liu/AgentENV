@@ -4,6 +4,7 @@
 //! [`FirecrackerSandboxFactory`] which wires sandbox configuration from the
 //! global [`ConfigManager`][crate::cfg::ConfigManager].
 
+mod cold_start;
 mod config;
 mod connector;
 mod factory;

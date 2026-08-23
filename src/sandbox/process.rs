@@ -247,47 +247,114 @@ impl<'a> Executor<'a> {
         opts: &ProcessOpts,
         stdin_enabled: bool,
     ) -> Result<ProcessHandle> {
-        let request = Request::new(StartRequest {
-            process: Some(ProcessConfig {
-                cmd: cmd.to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                envs: opts.envs.clone(),
-                cwd: opts.cwd.clone(),
-            }),
-            pty: None,
-            tag: None,
-            stdin: Some(stdin_enabled),
-        });
-
-        let mut client = self.envd_instance.process_client().await?;
-        let mut stream = client
-            .start(request)
-            .await
-            .context("failed to start process via envd")?
-            .into_inner();
-
-        // Wait for the StartEvent to learn the PID.
-        let pid = Self::wait_for_start_event(&mut stream).await?;
-
-        Ok(ProcessHandle {
-            pid,
+        let client = self.envd_instance.process_client().await?;
+        start_process_with_client(
             client,
-            stream,
-            timeout: opts.timeout,
-        })
+            cmd.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+            opts.clone(),
+            stdin_enabled,
+        )
+        .await
     }
+}
 
-    /// Consume stream messages until we get the `Start` event with the PID.
-    async fn wait_for_start_event(stream: &mut tonic::Streaming<StartResponse>) -> Result<u32> {
-        while let Some(response) = stream.next().await {
-            let resp = response.context("gRPC stream error while waiting for start event")?;
-            let Some(event_wrapper) = resp.event else {
-                continue;
-            };
-            if let Some(process_event::Event::Start(start_event)) = event_wrapper.event {
-                return Ok(start_event.pid);
-            }
+/// Owned-input variant of [`Executor::run_command_with_opts`]; see
+/// [`run_detached`] for how to drive it from `Send`-bounded contexts.
+pub(crate) async fn run_command_with_client(
+    client: ProcessClient,
+    cmd: String,
+    args: Vec<String>,
+    opts: ProcessOpts,
+) -> Result<ProcessOutput> {
+    let mut handle = start_process_with_client(client, cmd, args, opts, false).await?;
+    handle.wait().await
+}
+
+/// Owned-input variant of [`Executor::start_process`].
+pub(crate) async fn start_process_with_client(
+    mut client: ProcessClient,
+    cmd: String,
+    args: Vec<String>,
+    opts: ProcessOpts,
+    stdin_enabled: bool,
+) -> Result<ProcessHandle> {
+    let request = Request::new(StartRequest {
+        process: Some(ProcessConfig {
+            cmd,
+            args,
+            envs: opts.envs.clone(),
+            cwd: opts.cwd.clone(),
+        }),
+        pty: None,
+        tag: None,
+        stdin: Some(stdin_enabled),
+    });
+
+    let mut stream = client
+        .start(request)
+        .await
+        .context("failed to start process via envd")?
+        .into_inner();
+
+    // Wait for the StartEvent to learn the PID.
+    let pid = wait_for_start_event(&mut stream).await?;
+
+    Ok(ProcessHandle {
+        pid,
+        client,
+        stream,
+        timeout: opts.timeout,
+    })
+}
+
+/// Drives an envd guest-exec future to completion on a dedicated thread with
+/// its own current-thread runtime, and awaits its result.
+///
+/// Futures touching the envd gRPC transport cannot be proven `Send` by rustc
+/// (the transport's boxed service types trip rust-lang/rust#96865), so they
+/// cannot be awaited directly inside `async_trait` (Send) contexts such as
+/// [`SandboxBackend`][crate::sandbox::SandboxBackend] methods. The template
+/// builder solves this with a dedicated thread running a current-thread
+/// runtime (`src/template/runner.rs`); this helper packages the same pattern:
+/// `make_future` runs on the dedicated thread, so it may build and await
+/// non-`Send` futures, while the closure itself only captures `Send` data
+/// (owned strings, [`EnvdInstance::process_client_detached`] connect futures,
+/// and the like).
+pub(crate) async fn run_detached<T, F, Fut>(thread_name: &str, make_future: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create guest-exec runtime")
+                .and_then(|runtime| runtime.block_on(make_future()));
+            // The receiver being gone just means the caller was cancelled.
+            let _ = result_tx.send(result);
+        })
+        .context("spawn guest-exec thread")?;
+    result_rx
+        .await
+        .context("guest-exec thread exited without a result")?
+}
+
+/// Consume stream messages until we get the `Start` event with the PID.
+async fn wait_for_start_event(stream: &mut tonic::Streaming<StartResponse>) -> Result<u32> {
+    while let Some(response) = stream.next().await {
+        let resp = response.context("gRPC stream error while waiting for start event")?;
+        let Some(event_wrapper) = resp.event else {
+            continue;
+        };
+        if let Some(process_event::Event::Start(start_event)) = event_wrapper.event {
+            return Ok(start_event.pid);
         }
-        bail!("process stream closed before receiving start event");
     }
+    bail!("process stream closed before receiving start event");
 }

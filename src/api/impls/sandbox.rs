@@ -17,7 +17,10 @@ use crate::orchestrator::{
     SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
-use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+use crate::sandbox::{
+    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    SnapshotCaptureOptions,
+};
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
 };
@@ -1113,8 +1116,15 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
+        let capture_options = SnapshotCaptureOptions {
+            disk_only: body.disk_only.unwrap_or(false),
+        };
         let capture = match timer
-            .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
+            .time(
+                "capture",
+                self.orchestrator
+                    .capture_snapshot(sandbox_id, capture_options),
+            )
             .await
         {
             Ok(capture) => capture,

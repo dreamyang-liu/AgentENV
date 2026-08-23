@@ -69,6 +69,30 @@ impl EnvdInstance {
         Ok(client)
     }
 
+    /// Connects a process client without borrowing `self` across the await.
+    ///
+    /// The returned future owns its inputs and is `Send + 'static`, so it can
+    /// be driven from `async_trait` (Send) contexts where holding a
+    /// `&EnvdInstance` borrow trips rustc's Send inference for the envd
+    /// transport types (rust-lang/rust#96865).
+    pub(crate) fn process_client_detached(
+        &self,
+    ) -> impl std::future::Future<Output = Result<ProcessClient>> + Send + 'static {
+        let grpc_address = self.grpc_address.clone();
+        let access_token = self.access_token.clone();
+        async move {
+            trace!(grpc_address = %grpc_address, "connecting envd process client");
+            let client = ProcessClient::connect(
+                &grpc_address,
+                access_token.as_ref().map(EnvdAccessToken::expose),
+            )
+            .await
+            .context("failed to connect process client")?;
+            trace!("connected to envd process client");
+            Ok(client)
+        }
+    }
+
     /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {

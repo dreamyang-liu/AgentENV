@@ -545,6 +545,18 @@ impl RunnableSnapshot {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        record: SnapshotRecord,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> Self {
+        Self {
+            record,
+            manifest,
+            _lease: default_runtime_artifact_lease(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_test_manifest(
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,

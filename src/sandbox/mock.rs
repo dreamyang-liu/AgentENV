@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use super::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    SandboxRuntimeInfo, SnapshotCaptureOptions,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -299,7 +299,10 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior.apply_async(MockOperation::Resume).await
     }
 
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    async fn snapshot(
+        &mut self,
+        _options: SnapshotCaptureOptions,
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;

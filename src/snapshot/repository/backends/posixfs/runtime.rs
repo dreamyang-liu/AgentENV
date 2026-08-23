@@ -64,14 +64,24 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
                     reason: format!("snapshot '{}' is not ready", snapshot.id),
                 })?;
         let snapshot_id = snapshot.id.clone();
-        let vm_state_path = self.snapshot_vm_state_path(&snapshot_id)?;
         let committed_manifest = self
             .load_committed_firecracker_manifest(&snapshot_id)
             .await?;
+        // Disk-only snapshots have no VM state or memory artifacts to resolve.
+        let vm_state_path = if committed_manifest.vm_state.is_some() {
+            Some(self.snapshot_vm_state_path(&snapshot_id)?)
+        } else {
+            None
+        };
         let mut handles: Vec<CacheHandle> = Vec::new();
-        let mem_image_config_path = self
-            .materialize_mem_image_config(&snapshot_id, committed, &mut handles)
-            .await?;
+        let mem_image_config_path = if committed_manifest.memory.is_some() {
+            Some(
+                self.materialize_mem_image_config(&snapshot_id, committed, &mut handles)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let rootfs_label = format!("snapshot '{}'", snapshot.id);
         let rootfs_cache_key = runtime_image_cache_key(&snapshot.id, "rootfs/image.json");
         let rootfs_image_config_path = self

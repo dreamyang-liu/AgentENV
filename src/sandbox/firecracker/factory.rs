@@ -148,7 +148,18 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config)?;
+        // Only consumed by the cold-boot path (disk-only snapshots); resume
+        // rejects a cluster CPU config because the CPU state is already
+        // serialized inside vm_state.
+        let cold_boot_cpu_config = self
+            .cpu_config_arc
+            .as_ref()
+            .and_then(|arc| arc.read().unwrap().clone());
+        let sandbox = FirecrackerSandbox::from_snapshot_with_cpu_config(
+            snapshot,
+            &launch_config,
+            cold_boot_cpu_config,
+        )?;
         Ok(Box::new(sandbox))
     }
 

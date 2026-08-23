@@ -109,66 +109,77 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let layout = self.layout(&id);
         let mut handles: Vec<CacheHandle> = Vec::new();
 
-        // ── vm state snapshot ───────────────────────────────────────
-        let vm_state_key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let vm_state_client = Arc::clone(&self.client);
-        let p2p_transport = self.p2p_transport.clone();
-        let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let vm_state_handle = self
-            .cache
-            .ensure_cached(&vm_state_key, |dest| {
-                let client = Arc::clone(&vm_state_client);
-                let key = vm_state_key.clone();
-                let p2p_transport = p2p_transport.clone();
-                let p2p_key = vm_state_p2p_key.clone();
-                async move {
-                    if let Some(transport) = p2p_transport.as_ref() {
-                        match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
-                            Ok(size) => return Ok(size),
-                            Err(error) => {
-                                debug!(
-                                    key = %p2p_key,
-                                    error = %error,
-                                    "P2P vm_state fetch failed; using backend fallback"
-                                );
-                            }
-                        }
-                    }
-                    client.get_to_file(&key, &dest).await
-                }
-            })
-            .await
-            .map_err(|e| RepositoryError::ArtifactNotFound {
-                artifact: format!("vm state artifact for snapshot '{id}': {e}"),
-            })?;
-        let vm_state_path = vm_state_handle.path().to_path_buf();
-        handles.push(vm_state_handle);
-
         // ── firecracker manifest ───────────────────────────────────
         let committed_manifest = self
             .load_committed_firecracker_manifest(&layout, &id)
             .await?;
 
+        // ── vm state snapshot ───────────────────────────────────────
+        // Disk-only snapshots have no VM state artifact to fetch.
+        let vm_state_path = if committed_manifest.vm_state.is_some() {
+            let vm_state_key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+            let vm_state_client = Arc::clone(&self.client);
+            let p2p_transport = self.p2p_transport.clone();
+            let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+            let vm_state_handle = self
+                .cache
+                .ensure_cached(&vm_state_key, |dest| {
+                    let client = Arc::clone(&vm_state_client);
+                    let key = vm_state_key.clone();
+                    let p2p_transport = p2p_transport.clone();
+                    let p2p_key = vm_state_p2p_key.clone();
+                    async move {
+                        if let Some(transport) = p2p_transport.as_ref() {
+                            match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
+                                Ok(size) => return Ok(size),
+                                Err(error) => {
+                                    debug!(
+                                        key = %p2p_key,
+                                        error = %error,
+                                        "P2P vm_state fetch failed; using backend fallback"
+                                    );
+                                }
+                            }
+                        }
+                        client.get_to_file(&key, &dest).await
+                    }
+                })
+                .await
+                .map_err(|e| RepositoryError::ArtifactNotFound {
+                    artifact: format!("vm state artifact for snapshot '{id}': {e}"),
+                })?;
+            let vm_state_path = vm_state_handle.path().to_path_buf();
+            handles.push(vm_state_handle);
+            Some(vm_state_path)
+        } else {
+            None
+        };
+
         // ── memory image config ────────────────────────────────────
-        let memory_layers: Vec<OverlaybdLayerRef> = committed
-            .memory_layers
-            .iter()
-            .map(|m| OverlaybdLayerRef::Managed(m.clone()))
-            .collect();
-        let mem_cache_key = runtime_image_cache_key(&id, "memory/image.json");
-        let mem_image_config_path = self
-            .materialize_layers_and_pin(
-                &memory_layers,
-                &self.image_materializer.memory_image_config_path(&id),
-                MaterializeSpec {
-                    label: "memory",
-                    cache_key: &mem_cache_key,
-                    allow_empty_layers: true,
-                    download: None,
-                },
-                &mut handles,
+        let mem_image_config_path = if committed_manifest.memory.is_some() {
+            let memory_layers: Vec<OverlaybdLayerRef> = committed
+                .memory_layers
+                .iter()
+                .map(|m| OverlaybdLayerRef::Managed(m.clone()))
+                .collect();
+            let mem_cache_key = runtime_image_cache_key(&id, "memory/image.json");
+            Some(
+                self.materialize_layers_and_pin(
+                    &memory_layers,
+                    &self.image_materializer.memory_image_config_path(&id),
+                    MaterializeSpec {
+                        label: "memory",
+                        cache_key: &mem_cache_key,
+                        allow_empty_layers: true,
+                        download: None,
+                    },
+                    &mut handles,
+                )
+                .await?,
             )
-            .await?;
+        } else {
+            None
+        };
 
         // ── rootfs image config ────────────────────────────────────
         let rootfs_cache_key = runtime_image_cache_key(&id, "rootfs/image.json");

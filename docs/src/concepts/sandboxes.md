@@ -98,7 +98,7 @@ aenv snapshot create <sandbox-id>
 aenv snapshot create <sandbox-id> --name my-base
 ```
 
-The resulting snapshot appears in `aenv snapshot list` and can be started with `aenv start <name>`. See [Snapshots](./snapshots.md) for details.
+The resulting snapshot appears in `aenv snapshot list` and can be started with `aenv start <name>`. Pass `--disk-only` to capture only disk state (much cheaper to store; sandboxes created from it cold-boot instead of resuming). See [Snapshots](./snapshots.md) for details.
 
 ### Fork
 

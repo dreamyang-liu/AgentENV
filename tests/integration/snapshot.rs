@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
-    SandboxLaunchConfig,
+    SandboxLaunchConfig, SnapshotCaptureOptions,
 };
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
@@ -323,7 +323,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 
     write_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     let first_alias = unique_alias_for_test("lifecycle_first");
-    let first_capture = SandboxBackend::snapshot(&mut original).await?;
+    let first_capture = SandboxBackend::snapshot(&mut original, Default::default()).await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     write_guest_file(
         &original,
@@ -340,7 +340,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     .await?;
 
     let second_alias = unique_alias_for_test("lifecycle_second");
-    let second_capture = SandboxBackend::snapshot(&mut original).await?;
+    let second_capture = SandboxBackend::snapshot(&mut original, Default::default()).await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     assert_guest_file(
         &original,
@@ -427,6 +427,72 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     )
     .await?;
     resumed_original.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_only_snapshot_cold_boots_with_captured_disk_state() -> Result<()> {
+    common::setup().await;
+    let store = tempdir()?;
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+
+    let mut sandbox_config = common::default_sandbox_config()?;
+    sandbox_config.vcpu_count = 1;
+    sandbox_config.mem_size_mib = 128;
+    let mut original = FirecrackerSandbox::new(sandbox_config)?;
+    original.start().await?;
+    let source_sandbox_id = SandboxId::new();
+
+    // Use a rootfs-backed path: unlike full snapshots, a disk-only capture
+    // intentionally drops tmpfs contents along with the rest of memory.
+    write_guest_file(
+        &original,
+        "/root/agentenv-disk-only/state.txt",
+        "disk-state",
+    )
+    .await?;
+    let alias = unique_alias_for_test("disk_only");
+    let capture =
+        SandboxBackend::snapshot(&mut original, SnapshotCaptureOptions { disk_only: true }).await?;
+    // The source keeps running after a disk-only capture.
+    assert_guest_file(
+        &original,
+        "/root/agentenv-disk-only/state.txt",
+        "disk-state",
+    )
+    .await?;
+    let snapshot =
+        publish_captured_snapshot_for_test(&snapshot_manager, &alias, source_sandbox_id, capture)
+            .await?;
+    let committed = snapshot
+        .committed
+        .as_ref()
+        .context("published snapshot should be committed")?;
+    assert!(
+        committed.memory_layers.is_empty(),
+        "disk-only snapshot must not commit memory layers"
+    );
+    original.stop().await?;
+
+    let runnable = snapshot_manager.resolve_runnable(snapshot.clone()).await?;
+    assert!(!runnable.manifest().has_memory_state());
+    let launch_config = SandboxLaunchConfig {
+        sandbox_id: SandboxId::new(),
+        snapshot_id: runnable.record().id.to_string(),
+        env_vars: None,
+        network: None,
+        extra_mmds: serde_json::Map::new(),
+        custom_extension_params: None,
+        envd_access_token: None,
+    };
+    let mut child = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+    child.start().await?;
+    // Cold boot over the captured disk: the file survives without any
+    // memory artifacts existing for this snapshot.
+    assert_guest_file(&child, "/root/agentenv-disk-only/state.txt", "disk-state").await?;
+    child.stop().await?;
+
+    snapshot_manager.delete(&alias).await?;
     Ok(())
 }
 
@@ -536,7 +602,8 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     else {
                         unreachable!("candidate must be running");
                     };
-                    let captured = SandboxBackend::snapshot(sandbox.as_mut()).await?;
+                    let captured =
+                        SandboxBackend::snapshot(sandbox.as_mut(), Default::default()).await?;
                     assert_expected_files(sandbox, &expected_files_at_capture).await?;
                     let record = publish_captured_snapshot_for_test(
                         &snapshot_manager,

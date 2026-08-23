@@ -656,6 +656,16 @@ components:
         name:
           type: string
           description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+        diskOnly:
+          type: boolean
+          default: false
+          description: >-
+            Capture disk state only (rootfs and attached drives), skipping the
+            VM state and memory snapshot. Disk-only snapshots are much cheaper
+            to store but cannot be resumed: creating a sandbox from one boots
+            a fresh kernel over the captured disk state and re-runs the
+            snapshot's startup command. Guest filesystem buffers are synced
+            before capture.
 
     SandboxForkRequest:
       type: object

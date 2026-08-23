@@ -80,6 +80,53 @@ else
   _fail "snapshot remains launchable after source sandbox deletion" "running" "timeout"
 fi
 
+# -- Disk-only snapshot: capture without memory, relaunch cold-boots --
+disk_only_alias="e2e-disk-only-$(date +%s%N)"
+disk_only_source_id=$(create_sandbox "$AENV_TEMPLATE_ID" 60); _sync_http
+assert_status "$HTTP_STATUS" "201" "create disk-only source sandbox"
+track_sandbox "$disk_only_source_id"
+
+if wait_for_sandbox_state "$disk_only_source_id" "running" 30; then
+  _pass "disk-only source sandbox reaches running state"
+else
+  _fail "disk-only source sandbox reaches running state" "running" "timeout"
+fi
+
+api_post "/sandboxes/${disk_only_source_id}/snapshots" "$(jq -nc \
+  --arg name "$disk_only_alias" \
+  '{name: $name, diskOnly: true}')"
+assert_status "$HTTP_STATUS" "201" "POST snapshots with diskOnly returns 201"
+
+disk_only_snapshot_id=$(echo "$HTTP_BODY" | jq -r '.snapshotID // empty')
+assert_not_empty "$disk_only_snapshot_id" "disk-only snapshotID is present"
+track_template "$disk_only_snapshot_id"
+
+# The source keeps running after a disk-only capture.
+api_get "/sandboxes/${disk_only_source_id}"
+assert_status "$HTTP_STATUS" "200" "disk-only source sandbox still queryable"
+
+# Creating from a disk-only snapshot cold-boots a fresh kernel over the
+# captured disk state (no memory image exists to resume).
+cold_boot_sandbox_id=$(create_sandbox "$disk_only_alias" 60); _sync_http
+assert_status "$HTTP_STATUS" "201" "create sandbox from disk-only snapshot"
+assert_not_empty "$cold_boot_sandbox_id" "cold-boot sandbox ID is present"
+track_sandbox "$cold_boot_sandbox_id"
+
+if wait_for_sandbox_state "$cold_boot_sandbox_id" "running" 60; then
+  _pass "cold-booted sandbox reaches running state"
+else
+  _fail "cold-booted sandbox reaches running state" "running" "timeout"
+fi
+
+delete_sandbox "$cold_boot_sandbox_id"
+assert_status "$HTTP_STATUS" "204" "delete cold-booted sandbox"
+
+delete_sandbox "$disk_only_source_id"
+assert_status "$HTTP_STATUS" "204" "delete disk-only source sandbox"
+
+api_delete "/templates/${disk_only_snapshot_id}"
+assert_status "$HTTP_STATUS" "204" "delete disk-only snapshot returns 204"
+
 # -- Cleanup relaunched sandboxes and snapshot template explicitly --
 delete_sandbox "$relaunched_sandbox_id"
 assert_status "$HTTP_STATUS" "204" "delete first sandbox created from snapshot"

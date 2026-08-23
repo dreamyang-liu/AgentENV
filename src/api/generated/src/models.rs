@@ -6274,12 +6274,20 @@ pub struct SandboxSnapshotRequest {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Capture disk state only (rootfs and attached drives), skipping the VM state and memory snapshot. Disk-only snapshots are much cheaper to store but cannot be resumed: creating a sandbox from one boots a fresh kernel over the captured disk state and re-runs the snapshot's startup command. Guest filesystem buffers are synced before capture.
+    #[serde(rename = "diskOnly")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_only: Option<bool>,
 }
 
 impl SandboxSnapshotRequest {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new() -> SandboxSnapshotRequest {
-        SandboxSnapshotRequest { name: None }
+        SandboxSnapshotRequest {
+            name: None,
+            disk_only: Some(false),
+        }
     }
 }
 
@@ -6292,6 +6300,9 @@ impl std::fmt::Display for SandboxSnapshotRequest {
             self.name
                 .as_ref()
                 .map(|name| ["name".to_string(), name.to_string()].join(",")),
+            self.disk_only
+                .as_ref()
+                .map(|disk_only| ["diskOnly".to_string(), disk_only.to_string()].join(",")),
         ];
 
         write!(
@@ -6314,6 +6325,7 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub name: Vec<String>,
+            pub disk_only: Vec<bool>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6339,6 +6351,10 @@ impl std::str::FromStr for SandboxSnapshotRequest {
                     "name" => intermediate_rep.name.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskOnly" => intermediate_rep.disk_only.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxSnapshotRequest".to_string(),
@@ -6354,6 +6370,7 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(SandboxSnapshotRequest {
             name: intermediate_rep.name.into_iter().next(),
+            disk_only: intermediate_rep.disk_only.into_iter().next(),
         })
     }
 }

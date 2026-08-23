@@ -159,7 +159,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     let setup = sandbox.run_command("sh", &["-lc", setup_cmd]).await?;
     assert_eq!(setup.exit_code, 0);
 
-    let captured = SandboxBackend::snapshot(&mut sandbox).await?;
+    let captured = SandboxBackend::snapshot(&mut sandbox, Default::default()).await?;
     let _ = sandbox.stop().await;
 
     let metadata = SnapshotPublishMetadata {

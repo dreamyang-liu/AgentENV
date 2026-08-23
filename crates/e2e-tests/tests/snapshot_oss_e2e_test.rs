@@ -63,7 +63,11 @@ async fn write_built_artifacts(
     let memory_lower = root.join("mem.zfile.commit");
     write_zfile_memory_lower(&memory_lower).await?;
     std::fs::write(
-        &manifest.memory.image_config_path,
+        &manifest
+            .memory
+            .as_ref()
+            .expect("mock manifest should carry memory artifacts")
+            .image_config_path,
         format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, memory_lower.display()),
     )?;
     Ok((
@@ -219,8 +223,18 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     );
 
     let runnable = resolver.resolve(Arc::new(stored)).await?;
-    assert!(runnable.manifest().vm_state.path.exists());
-    assert!(runnable.manifest().memory.image_config_path.exists());
+    let runnable_vm_state = runnable
+        .manifest()
+        .vm_state
+        .as_ref()
+        .expect("full snapshot should carry vm state");
+    let runnable_memory = runnable
+        .manifest()
+        .memory
+        .as_ref()
+        .expect("full snapshot should carry memory artifacts");
+    assert!(runnable_vm_state.path.exists());
+    assert!(runnable_memory.image_config_path.exists());
     assert!(runnable.manifest().rootfs.image_config_path.exists());
 
     let rootfs_config: serde_json::Value = serde_json::from_slice(&std::fs::read(
@@ -233,9 +247,8 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     assert_eq!(rootfs_config["lowers"][0]["digest"], rootfs_digest);
     assert_eq!(rootfs_config["lowers"][0]["file"], "");
 
-    let mem_config: serde_json::Value = serde_json::from_slice(&std::fs::read(
-        runnable.manifest().memory.image_config_path.as_path(),
-    )?)?;
+    let mem_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(runnable_memory.image_config_path.as_path())?)?;
     assert_eq!(
         mem_config["repoBlobUrl"],
         format!("s3://{}/{prefix}/managed-layers", fixture.bucket)

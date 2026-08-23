@@ -25,6 +25,10 @@ enum Sub {
         /// Snapshot name or alias. If omitted, the server returns the generated snapshot ID.
         #[arg(long)]
         name: Option<String>,
+        /// Capture disk state only (no VM state / memory). Much cheaper to
+        /// store, but sandboxes created from it cold-boot instead of resuming.
+        #[arg(long = "disk-only")]
+        disk_only: bool,
     },
     /// List persistent snapshots
     #[command(visible_alias = "ls")]
@@ -40,7 +44,11 @@ enum Sub {
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
     match args.cmd {
-        Sub::Create { sandbox_id, name } => create(&client, &sandbox_id, name.as_deref()),
+        Sub::Create {
+            sandbox_id,
+            name,
+            disk_only,
+        } => create(&client, &sandbox_id, name.as_deref(), disk_only),
         Sub::List { sandbox_id, output } => {
             list(&client, sandbox_id.as_deref(), output::resolve(output))
         }
@@ -57,8 +65,8 @@ struct Row {
     image_ref: String,
 }
 
-fn create(client: &Client, sandbox_id: &str, name: Option<&str>) -> Result<()> {
-    let snapshot = client.create_snapshot(sandbox_id, name)?;
+fn create(client: &Client, sandbox_id: &str, name: Option<&str>, disk_only: bool) -> Result<()> {
+    let snapshot = client.create_snapshot(sandbox_id, name, disk_only)?;
     println!("Created snapshot {}", snapshot.snapshot_id);
     if let Some(image_ref) = &snapshot.image_ref {
         println!("Image: {image_ref}");

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 struct CreateSnapshot<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
+    #[serde(rename = "diskOnly", skip_serializing_if = "std::ops::Not::not")]
+    disk_only: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -19,8 +21,13 @@ pub struct SnapshotInfo {
 }
 
 impl Client {
-    pub fn create_snapshot(&self, sandbox_id: &str, name: Option<&str>) -> Result<SnapshotInfo> {
-        let body = CreateSnapshot { name };
+    pub fn create_snapshot(
+        &self,
+        sandbox_id: &str,
+        name: Option<&str>,
+        disk_only: bool,
+    ) -> Result<SnapshotInfo> {
+        let body = CreateSnapshot { name, disk_only };
         let resp = handle_status(
             self.post(&format!("/sandboxes/{}/snapshots", sandbox_id))
                 .send_json(&body),
@@ -65,11 +72,26 @@ mod tests {
 
     #[test]
     fn create_snapshot_serializes_optional_name() {
-        let named = serde_json::to_value(CreateSnapshot { name: Some("base") }).unwrap();
+        let named = serde_json::to_value(CreateSnapshot {
+            name: Some("base"),
+            disk_only: false,
+        })
+        .unwrap();
         assert_eq!(named["name"], "base");
 
-        let unnamed = serde_json::to_value(CreateSnapshot { name: None }).unwrap();
+        let unnamed = serde_json::to_value(CreateSnapshot {
+            name: None,
+            disk_only: false,
+        })
+        .unwrap();
         assert_eq!(unnamed, serde_json::json!({}));
+
+        let disk_only = serde_json::to_value(CreateSnapshot {
+            name: None,
+            disk_only: true,
+        })
+        .unwrap();
+        assert_eq!(disk_only, serde_json::json!({"diskOnly": true}));
     }
 
     #[test]

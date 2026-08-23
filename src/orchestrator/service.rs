@@ -18,7 +18,7 @@ use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
     SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxNetworkPolicy, SandboxRuntimeInfo, SnapshotCaptureOptions,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -373,7 +373,11 @@ where
                 let record = snapshot.record();
                 let committed = snapshot.committed();
                 let configured_mode = ConfigManager::global_config().virtualization_mode;
-                if committed.virtualization_mode != configured_mode {
+                // Disk-only snapshots cold-boot a fresh kernel: no VM state
+                // crosses the KVM/PVM ABI, so the capture-time virtualization
+                // mode does not constrain the node.
+                let cold_boot = !snapshot.manifest().has_memory_state();
+                if !cold_boot && committed.virtualization_mode != configured_mode {
                     self.counters.record_create_fail(1);
                     return Err(OrchestratorError::VirtualizationModeMismatch {
                         resource: format!("snapshot {}", record.id),
@@ -403,12 +407,37 @@ where
                     envd_access_token: envd_access_token.clone(),
                 };
 
+                // A cold-booted sandbox runs the node's virtualization mode,
+                // kernel, and Firecracker (only tools drive and envd come from
+                // the snapshot); a resumed sandbox inherits everything from
+                // the snapshot. Metadata must reflect what actually runs so
+                // snapshots published from this sandbox stay accurate.
+                let (metadata_virtualization_mode, metadata_runtime_versions) = if cold_boot {
+                    let node_versions = configured_runtime_versions();
+                    (
+                        configured_mode,
+                        SnapshotRuntimeVersions {
+                            kernel_version: node_versions.kernel_version,
+                            firecracker_version: node_versions.firecracker_version,
+                            envd_version: committed.runtime_versions.envd_version.clone(),
+                            tools_drive_version: committed
+                                .runtime_versions
+                                .tools_drive_version
+                                .clone(),
+                        },
+                    )
+                } else {
+                    (
+                        committed.virtualization_mode,
+                        committed.runtime_versions.clone(),
+                    )
+                };
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
-                    virtualization_mode: committed.virtualization_mode,
-                    runtime_versions: committed.runtime_versions.clone(),
+                    virtualization_mode: metadata_virtualization_mode,
+                    runtime_versions: metadata_runtime_versions,
                     resources: *snapshot.resources(),
                     context: committed.context.clone(),
                     startup: committed.startup.clone(),
@@ -1411,10 +1440,11 @@ where
     pub async fn capture_snapshot(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
+        options: SnapshotCaptureOptions,
     ) -> Result<SnapshotCaptureResult> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
-            this.capture_snapshot_inner(sandbox_id).await
+            this.capture_snapshot_inner(sandbox_id, options).await
         })
         .await
     }
@@ -1422,11 +1452,12 @@ where
     #[tracing::instrument(
         name = "capture_snapshot",
         skip(self),
-        fields(sandbox_id = %sandbox_id)
+        fields(sandbox_id = %sandbox_id, disk_only = options.disk_only)
     )]
     async fn capture_snapshot_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
+        options: SnapshotCaptureOptions,
     ) -> Result<SnapshotCaptureResult> {
         self.ensure_accepting_lifecycle_operations()?;
 
@@ -1468,7 +1499,7 @@ where
         // Call sandbox backend to capture the snapshot.
         let captured_snapshot_result = {
             let mut sandbox = handle.lock().await;
-            sandbox.snapshot().await
+            sandbox.snapshot(options).await
         };
 
         // If snapshot capture failed, attempt to roll back to Running state and return an error.

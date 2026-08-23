@@ -253,7 +253,9 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             })
             .await?;
         let sandbox_id = created.id;
-        let capture = orchestrator.capture_snapshot(sandbox_id).await?;
+        let capture = orchestrator
+            .capture_snapshot(sandbox_id, Default::default())
+            .await?;
         assert_eq!(capture.metadata.id, sandbox_id);
         assert_eq!(capture.metadata.state, SandboxState::Running);
         assert_eq!(capture.metadata.context.workdir, "/workspace");

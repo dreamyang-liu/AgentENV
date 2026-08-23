@@ -134,20 +134,21 @@ impl SnapshotManager {
             return;
         };
 
-        // Prepare the manifest and VM state.
+        // Prepare the manifest and VM state. Disk-only snapshots carry no VM
+        // state or memory artifacts.
         let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
-        let mut artifacts = vec![
-            SnapshotP2pArtifact::fixed(
+        let mut artifacts = vec![SnapshotP2pArtifact::bytes(
+            snapshot_id,
+            SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+            manifest_bytes,
+        )];
+        if let Some(vm_state) = &manifest.vm_state {
+            artifacts.push(SnapshotP2pArtifact::fixed(
                 snapshot_id,
                 SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-                manifest.vm_state.path.clone(),
-            ),
-            SnapshotP2pArtifact::bytes(
-                snapshot_id,
-                SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-                manifest_bytes,
-            ),
-        ];
+                vm_state.path.clone(),
+            ));
+        }
 
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
@@ -155,11 +156,13 @@ impl SnapshotManager {
             &manifest.rootfs.image_config_path,
             &rootfs_uuids,
         ));
-        let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.memory.image_config_path,
-            &memory_uuids,
-        ));
+        if let Some(memory) = &manifest.memory {
+            let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
+            artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
+                &memory.image_config_path,
+                &memory_uuids,
+            ));
+        }
         for drive in &manifest.attached_drives {
             let drive_uuids = committed
                 .attached_drives
@@ -370,7 +373,13 @@ mod tests {
 
         assert_eq!(runnable.record().id, snapshot_id);
         assert!(runnable.manifest().rootfs.image_config_path.exists());
-        assert!(runnable.manifest().vm_state.path.exists());
+        assert!(runnable
+            .manifest()
+            .vm_state
+            .as_ref()
+            .expect("full snapshot should carry vm state")
+            .path
+            .exists());
     }
 
     #[tokio::test]
