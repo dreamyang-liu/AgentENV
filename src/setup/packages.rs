@@ -262,6 +262,8 @@ fn distro_from_id(id: &str) -> Option<Distro> {
             Some(Distro::Centos)
         }
         "rhel" | "redhat" | "redhatenterpriseserver" => Some(Distro::Rhel),
+        // Amazon Linux is dnf/yum-based; treat it like the RHEL family.
+        "amzn" | "fedora" => Some(Distro::Rhel),
         "arch" | "manjaro" => Some(Distro::Arch),
         _ => None,
     }
