@@ -27,7 +27,15 @@ use crate::snapshot::StartupCommand;
 /// Default ready command when a startup command has no explicit ready check.
 /// Keep in sync with the template builder's `DEFAULT_READY_WITH_START_CMD`.
 const DEFAULT_READY_WITH_START_CMD: &str = "sleep 20";
-const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Ready polling backs off exponentially from 50ms to this cap. A fixed
+/// 2-second interval made the interval itself the dominant cost of every
+/// cold boot with a startup command: the runtime typically listens within
+/// ~100ms of the start command, so the first (immediate) probe raced it,
+/// lost, and the boot then idled for the full interval -- measured as ~2s of
+/// a ~3s restore-from-disk-only-snapshot. Slow-starting services still get
+/// the same 10-minute deadline, just probed more eagerly at first.
+const READY_RETRY_INITIAL: Duration = Duration::from_millis(50);
+const READY_RETRY_MAX: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Normalizes a persisted startup command for cold boot, mirroring the
@@ -92,6 +100,7 @@ async fn run_ready_command(
 ) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut attempt = 0_u64;
+    let mut retry_interval = READY_RETRY_INITIAL;
 
     let mut opts = ProcessOpts {
         envs: startup.context.env_vars.clone(),
@@ -164,11 +173,8 @@ async fn run_ready_command(
             }
         }
 
-        tokio::time::sleep_until(std::cmp::min(
-            Instant::now() + READY_RETRY_INTERVAL,
-            deadline,
-        ))
-        .await;
+        tokio::time::sleep_until(std::cmp::min(Instant::now() + retry_interval, deadline)).await;
+        retry_interval = std::cmp::min(retry_interval * 2, READY_RETRY_MAX);
     }
 }
 
