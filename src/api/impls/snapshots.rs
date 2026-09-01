@@ -188,6 +188,47 @@ impl Snapshots<()> for ApiImpl {
         }
     }
 
+    async fn snapshots_snapshot_id_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+    ) -> Result<SnapshotsSnapshotIdDeleteResponse, ()> {
+        // Same visibility scope as GET and the list: this API only knows
+        // sandbox-sourced snapshots. A template reached through this endpoint
+        // is refused rather than hidden, because "204 but it still exists"
+        // would be a lie and silently deleting a template would remove an
+        // artifact shared by every sandbox launched from it.
+        match self.snapshot_manager.get(&path_params.snapshot_id).await {
+            Ok(Some(record)) if !matches!(record.source, SnapshotSource::Sandbox { .. }) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status409_TheIdNamesATemplate(
+                    Self::error(
+                        409,
+                        format!(
+                            "'{}' is a template, not a sandbox snapshot; manage it through the template API",
+                            path_params.snapshot_id
+                        ),
+                    ),
+                ));
+            }
+            // Absent is success: delete is idempotent so sweepers can retry.
+            Ok(_) => {}
+            Err(err) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        }
+        match self.snapshot_manager.delete(&path_params.snapshot_id).await {
+            Ok(()) => Ok(SnapshotsSnapshotIdDeleteResponse::Status204_SnapshotDeleted),
+            Err(err) => Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                Self::snapshot_manager_error(&err),
+            )),
+        }
+    }
+
     async fn snapshots_snapshot_id_squash_post(
         &self,
         _method: &Method,

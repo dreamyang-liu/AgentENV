@@ -218,6 +218,12 @@ pub struct SnapshotsGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SnapshotsSnapshotIdDeletePathParams {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsSnapshotIdGetPathParams {
     pub snapshot_id: String,
 }
@@ -3342,9 +3348,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 

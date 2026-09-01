@@ -33,8 +33,6 @@ pub enum SnapshotsSnapshotIdDeleteResponse {
     Status204_SnapshotDeleted,
     /// Authentication error
     Status401_AuthenticationError(models::Error),
-    /// The id names a template, not a sandbox snapshot. This API only exposes sandbox-sourced snapshots (mirroring GET and the list), so template records must be managed through the template API -- deleting one here would silently remove an artifact shared by every sandbox launched from it.
-    Status409_TheIdNamesATemplate(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }

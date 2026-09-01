@@ -1967,6 +1967,53 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+    delete:
+      summary: Delete snapshot
+      description: >-
+        Delete a committed snapshot record by id or alias. Idempotent: deleting
+        a snapshot that does not exist is a success, so callers can retry and
+        sweep without first checking existence.
+
+        Only the snapshot's own record, per-snapshot artifacts and alias
+        bindings are removed. Layers live in the shared, content-addressed
+        managed-layer store and are reference-counted there: a layer shared
+        with other snapshots (a fork's parent chain, a deduplicated rootfs
+        commit) survives until the last snapshot referencing it is deleted, so
+        deleting a parent does not break its children. Storage is reclaimed
+        when layers become unreferenced, not necessarily at response time.
+
+        Sandboxes currently RUNNING from this snapshot keep their mounted
+        layers; the deletion prevents new launches, it does not kill existing
+        ones.
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AccessTokenAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "204":
+          description: Snapshot deleted (or already absent)
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          description: >-
+            The id names a template, not a sandbox snapshot. This API only
+            exposes sandbox-sourced snapshots (mirroring GET and the list),
+            so template records must be managed through the template API --
+            deleting one here would silently remove an artifact shared by
+            every sandbox launched from it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/500"
+
   /snapshots/{snapshotID}/squash:
     post:
       summary: Squash snapshot chain
