@@ -15,6 +15,22 @@ The reverse proxy lets you reach services running inside a sandbox from outside.
 
 Query strings are forwarded unchanged.
 
+## HTTP Connection Retries
+
+Before transmitting an HTTP request, the proxy retries failed upstream TCP
+connections up to three additional times, waiting 1, 2, and 4 seconds. Each
+connection attempt retains its 5-second timeout; retries do not reset the
+existing request-body idle or response-header deadlines. Exhausted connection
+attempts return 502; an enclosing proxy deadline can end the attempt sooner
+with 504.
+
+Retries occur inside the connector, which has no access to the HTTP request
+body. The proxy does not replay requests after connection establishment, on
+upstream HTTP errors (including 502), or when a response times out or disconnects.
+Streaming bodies remain streamed, without buffering for replay. Dropping the
+request future cancels pending connection attempts and backoff waits. WebSocket
+connections use their existing separate path and are unchanged.
+
 ## Required Headers
 
 Each proxied request must identify the target sandbox and port:

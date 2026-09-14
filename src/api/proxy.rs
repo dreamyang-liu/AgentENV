@@ -1,4 +1,9 @@
-use std::{error::Error as StdError, future::Future, time::Duration};
+use std::{
+    error::Error as StdError,
+    future::Future,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -15,7 +20,7 @@ use axum::{
     routing::any,
     Router,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{future::BoxFuture, SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::{
@@ -32,6 +37,7 @@ use tokio_tungstenite::{
     },
     MaybeTlsStream, WebSocketStream,
 };
+use tower::{Service, ServiceExt};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -49,8 +55,57 @@ use crate::{
 use crate::api::impls::auth::{API_KEY_HEADER, ENVD_ACCESS_TOKEN_HEADER};
 
 /// Shared outbound HTTP client for the client-facing reverse proxy.
-pub(crate) type ProxyClient = Client<HttpConnector, Body>;
+pub(crate) type ProxyClient = Client<RetryingConnector<HttpConnector>, Body>;
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Clone)]
+pub(crate) struct RetryingConnector<Connector> {
+    inner: Connector,
+    backoffs: [Duration; 3],
+}
+
+impl<Connector> Service<Uri> for RetryingConnector<Connector>
+where
+    Connector: Service<Uri> + Clone + Send + 'static,
+    Connector::Future: Send,
+    Connector::Response: Send,
+    Connector::Error: StdError + Send + Sync,
+{
+    type Response = Connector::Response;
+    type Error = Connector::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, destination: Uri) -> Self::Future {
+        let mut connector = self.inner.clone();
+        let backoffs = self.backoffs;
+        Box::pin(async move {
+            for attempt in 0..=backoffs.len() {
+                let result = connector.ready().await?.call(destination.clone()).await;
+                match result {
+                    Ok(connection) => return Ok(connection),
+                    Err(error) => {
+                        let Some(delay) = backoffs.get(attempt) else {
+                            warn!(attempts = attempt + 1, error = ?error, "proxy connection retries exhausted");
+                            return Err(error);
+                        };
+                        warn!(
+                            retry = attempt + 1,
+                            delay_ms = delay.as_millis(),
+                            error = ?error,
+                            "proxy connection failed before request transmission; retrying"
+                        );
+                        tokio::time::sleep(*delay).await;
+                    }
+                }
+            }
+            unreachable!()
+        })
+    }
+}
 
 struct ResolvedProxyRequest {
     sandbox_id: SandboxId,
@@ -95,6 +150,19 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
+const PROXY_CONNECT_RETRY_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+];
+#[cfg(not(test))]
+const PROXY_CONNECT_RETRY_BACKOFFS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+#[cfg(test)]
 const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -132,7 +200,11 @@ pub(crate) fn build_proxy_client() -> ProxyClient {
     // its idle pool by authority, so a pooled connection can retain a stale VM flow.
     Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(0)
-        .build(connector)
+        .retry_canceled_requests(false)
+        .build(RetryingConnector {
+            inner: connector,
+            backoffs: PROXY_CONNECT_RETRY_BACKOFFS,
+        })
 }
 
 pub(crate) fn router<I>(api_impl: I) -> Router
@@ -506,7 +578,7 @@ async fn proxy_http_request(
                 );
                 return StatusCode::BAD_GATEWAY.into_response();
             }
-            warn!(sandbox_id = %sandbox_id, error = %err, "upstream proxy request failed");
+            warn!(sandbox_id = %sandbox_id, error = ?err, "upstream proxy request failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -1354,6 +1426,256 @@ mod tests {
             .uri(format!("http://{address}/health"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_connector_retries_connect_errors_with_bounded_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let timings = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed_timings = timings.clone();
+            let mut connector = RetryingConnector {
+                inner: tower::service_fn(move |_: Uri| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    observed_timings
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
+                    std::future::ready(Err::<(), _>(std::io::Error::from(kind)))
+                }),
+                backoffs: PROXY_CONNECT_RETRY_BACKOFFS,
+            };
+            let started = tokio::time::Instant::now();
+            let error = connector
+                .call(Uri::from_static("http://127.0.0.1/"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(attempts.load(Ordering::SeqCst), 4);
+            assert!(
+                started.elapsed() >= PROXY_CONNECT_RETRY_BACKOFFS.into_iter().sum::<Duration>()
+            );
+            for (interval, backoff) in timings
+                .lock()
+                .unwrap()
+                .windows(2)
+                .zip(PROXY_CONNECT_RETRY_BACKOFFS)
+            {
+                assert!(interval[1] - interval[0] >= backoff);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_connector_stops_retrying_after_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut connector = RetryingConnector {
+            inner: tower::service_fn(move |_: Uri| {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if attempt < 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                } else {
+                    Ok(())
+                })
+            }),
+            backoffs: PROXY_CONNECT_RETRY_BACKOFFS,
+        };
+        connector
+            .call(Uri::from_static("http://127.0.0.1/"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn proxy_connector_cancellation_stops_backoff_and_pending_connect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for pending in [false, true] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let mut connector = RetryingConnector {
+                inner: tower::service_fn(move |_: Uri| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if pending {
+                            std::future::pending::<()>().await;
+                        }
+                        Err::<(), _>(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                    }
+                }),
+                backoffs: [Duration::from_secs(1); 3],
+            };
+            assert!(timeout(
+                Duration::from_millis(5),
+                connector.call(Uri::from_static("http://127.0.0.1/")),
+            )
+            .await
+            .is_err());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_client_retries_before_polling_streaming_post_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = body_polls.clone();
+        let body = Body::from_stream(
+            stream::iter([
+                Ok::<_, Infallible>(Bytes::from_static(b"shell ")),
+                Ok(Bytes::from_static(b"payload")),
+            ])
+            .inspect(move |_| {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed_executions = executions.clone();
+        let upstream = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+            let listener = socket.listen(128).unwrap();
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/shell",
+                    post(move |body: Bytes| {
+                        observed_executions.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            assert_eq!(body, "shell payload");
+                            StatusCode::CREATED
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{address}/shell"))
+            .body(body)
+            .unwrap();
+        let response = timeout(
+            Duration::from_secs(2),
+            build_proxy_client().request(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        upstream.abort();
+        let _ = upstream.await;
+    }
+
+    #[tokio::test]
+    async fn proxy_client_does_not_retry_submitted_post_or_upstream_502() {
+        for response in [
+            &b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"[..],
+            &b""[..],
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                read_http_request_head(&mut connection).await;
+                connection.write_all(response).await.unwrap();
+                drop(connection);
+                assert!(timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err());
+            });
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{address}/shell"))
+                .body(Body::empty())
+                .unwrap();
+            let result = build_proxy_client().request(request).await;
+            if response.is_empty() {
+                assert!(!result.unwrap_err().is_connect());
+            } else {
+                assert_eq!(result.unwrap().status(), StatusCode::BAD_GATEWAY);
+            }
+            upstream.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_connection_retry_respects_outer_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let connector = RetryingConnector {
+            inner: tower::service_fn(move |_: Uri| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<hyper_util::rt::TokioIo<tokio::net::TcpStream>, _>(
+                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ))
+            }),
+            backoffs: [Duration::from_secs(1); 3],
+        };
+        let client = Client::builder(TokioExecutor::new())
+            .pool_max_idle_per_host(0)
+            .retry_canceled_requests(false)
+            .build(connector);
+        let (body, activity) = track_request_body_activity(Body::empty());
+        let request = Request::builder()
+            .uri("http://127.0.0.1/shell")
+            .body(body)
+            .unwrap();
+        assert!(wait_for_upstream_response_headers_with_activity_timeout(
+            client.request(request),
+            activity,
+        )
+        .await
+        .is_err());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_client_does_not_replay_post_after_response_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut connection).await;
+            assert!(timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err());
+        });
+        let (body, activity) = track_request_body_activity(Body::empty());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{address}/shell"))
+            .body(body)
+            .unwrap();
+        assert!(wait_for_upstream_response_headers_with_activity_timeout(
+            build_proxy_client().request(request),
+            activity,
+        )
+        .await
+        .is_err());
+        upstream.await.unwrap();
     }
 
     #[tokio::test]
