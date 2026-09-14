@@ -27,7 +27,20 @@ if [[ $EUID -ne 0 ]] && ! sudo -v 2>/dev/null; then
     exit 1
 fi
 
-REPO="kvcache-ai/AgentENV"
+REPO="${AENV_RELEASE_REPO:-kvcache-ai/AgentENV}"
+RELEASE_VERSION="${AENV_RELEASE_VERSION:-latest}"
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "error: AENV_RELEASE_REPO must be an owner/repository name" >&2
+    exit 1
+fi
+if [[ "$RELEASE_VERSION" == "latest" ]]; then
+    RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
+elif [[ "$RELEASE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    RELEASE_API="https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_VERSION}"
+else
+    echo "error: AENV_RELEASE_VERSION must be latest or a release tag" >&2
+    exit 1
+fi
 INSTALL_DIR="/usr/local/bin"
 SKIP_SETUP="${SKIP_SETUP:-0}"
 DATA_DIR="${AENV_HOME_PATH:-/var/lib/aenv}"
@@ -71,7 +84,6 @@ if [[ "$OS" != "linux" ]]; then
     exit 1
 fi
 
-RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
 if [[ "$VIRTUALIZATION_MODE" == "pvm" ]]; then
     TARBALL="aenv-server-${OS}-${ARCH_TAG}-pvm.tar.gz"
 else

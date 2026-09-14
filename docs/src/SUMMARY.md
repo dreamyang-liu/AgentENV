@@ -9,6 +9,7 @@
 
 # Deployment
 
+- [Ash Fork Release](./deployment/ash-fork-release.md)
 - [Docker (Single Node)](./deployment/docker.md)
 - [Docker Compose (Multi-Node Simulation)](./deployment/docker-compose.md)
 - [Static Multi-Node (Without Kubernetes)](./deployment/static-multi-node.md)

@@ -11,7 +11,20 @@
 
 set -euo pipefail
 
-REPO="kvcache-ai/AgentENV"
+REPO="${AENV_RELEASE_REPO:-kvcache-ai/AgentENV}"
+RELEASE_VERSION="${AENV_RELEASE_VERSION:-latest}"
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "error: AENV_RELEASE_REPO must be an owner/repository name" >&2
+    exit 1
+fi
+if [[ "$RELEASE_VERSION" == "latest" ]]; then
+    RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
+elif [[ "$RELEASE_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    RELEASE_API="https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_VERSION}"
+else
+    echo "error: AENV_RELEASE_VERSION must be latest or a release tag" >&2
+    exit 1
+fi
 INSTALL_DIR="${INSTALL_DIR:-}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -42,7 +55,6 @@ if [[ -z "$INSTALL_DIR" ]]; then
 fi
 
 ASSET="aenv-${OS}-${ARCH_TAG}"
-RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
 DEST="${INSTALL_DIR}/aenv"
 TMP="$(mktemp)"
 RELEASE_METADATA="$(mktemp)"

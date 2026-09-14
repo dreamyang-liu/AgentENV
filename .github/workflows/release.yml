@@ -14,6 +14,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Validate release installers
+        run: bash scripts/tests/verify-release-source.sh
+
       - name: Verify tag matches package versions
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -214,6 +217,26 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      - name: Add installers and checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          cp scripts/install.sh scripts/install-cli.sh dist/
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("dist/build-info.json").write_text(json.dumps({
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "tag": os.environ["RELEASE_TAG"],
+              "commit": os.environ["RELEASE_COMMIT"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+          }, indent=2) + "\n")
+          PY
+          (cd dist && sha256sum aenv-* install*.sh build-info.json > SHA256SUMS)
+
       - name: Generate release notes
         id: git-cliff
         uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5  # v4.8.0
@@ -232,7 +255,9 @@ jobs:
 
           {
             printf '📖 Documentation for this release: '
-            printf 'https://kvcache-ai.github.io/AgentENV/%s/\n' "$RELEASE_TAG"
+            printf 'https://github.com/%s/blob/%s/docs/src/SUMMARY.md\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+            printf '\nPinned fork installation and known validation limits: '
+            printf 'https://github.com/%s/blob/%s/docs/src/deployment/ash-fork-release.md\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG"
             printf '\n---\n\n'
             cat CHANGES.md
           } > CHANGES.md.tmp
@@ -242,6 +267,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: CHANGES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          fail_on_unmatched_files: true
           files: |
             dist/aenv-linux-x86_64
             dist/aenv-linux-aarch64
@@ -250,6 +278,10 @@ jobs:
             dist/aenv-server-linux-x86_64-pvm.tar.gz
             dist/aenv-server-linux-x86_64.tar.gz
             dist/aenv-server-linux-aarch64.tar.gz
+            dist/install.sh
+            dist/install-cli.sh
+            dist/build-info.json
+            dist/SHA256SUMS
 
       - uses: actions/upload-artifact@v7
         with:
@@ -328,10 +360,13 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${OWNER}/aenv-server"
           version="${GITHUB_REF_NAME}"
+          tags=(--tag "${image}:${version}")
+          if [[ "$version" != *-* ]]; then
+            tags+=(--tag "${image}:latest")
+          fi
 
           docker buildx imagetools create \
-            --tag "${image}:${version}" \
-            --tag "${image}:latest" \
+            "${tags[@]}" \
             "${image}:${version}-amd64" \
             "${image}:${version}-arm64"
 
@@ -376,4 +411,4 @@ jobs:
             AENV_VIRTUALIZATION_MODE=pvm
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-pvm
-            ghcr.io/${{ env.OWNER }}/aenv-server:latest-pvm
+            ${{ !contains(github.ref_name, '-') && format('ghcr.io/{0}/aenv-server:latest-pvm', env.OWNER) || '' }}
