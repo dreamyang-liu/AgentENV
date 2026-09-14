@@ -127,8 +127,10 @@ impl PosixFsSnapshotRepository {
     fn committed_snapshot(
         metadata: &SnapshotPublishMetadata,
         built: CollectedBuiltArtifacts,
+        delta_empty: Option<bool>,
     ) -> CommittedSnapshot {
         CommittedSnapshot {
+            delta_empty,
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
@@ -183,7 +185,7 @@ impl PosixFsSnapshotRepository {
             }
         };
 
-        let committed = Self::committed_snapshot(&metadata, built);
+        let committed = Self::committed_snapshot(&metadata, built, manifest.delta_empty);
         match self
             .catalog_store
             .commit_publish(&session, metadata, committed)
@@ -443,7 +445,8 @@ mod tests {
         let repository = backend.repository();
         let resolver = backend.runtime_resolver();
         let snapshot_id = SnapshotId::generate();
-        let local_artifacts = seed_built_snapshot(tempdir.path());
+        let mut local_artifacts = seed_built_snapshot(tempdir.path());
+        local_artifacts.delta_empty = Some(true);
         let metadata = sample_metadata(snapshot_id, Some("mvp"));
         let stored = repository
             .publish(metadata, local_artifacts)
@@ -456,12 +459,14 @@ mod tests {
             .expect("get should work")
             .expect("snapshot should exist");
         assert_eq!(stored.id, fetched.id);
+        assert_eq!(fetched.committed.as_ref().unwrap().delta_empty, Some(true));
 
         let runnable = resolver
             .resolve(Arc::new(fetched))
             .await
             .expect("resolve should work");
         assert!(runnable.manifest().rootfs.image_config_path.exists());
+        assert_eq!(runnable.manifest().delta_empty, Some(true));
         assert!(runnable
             .manifest()
             .vm_state
@@ -693,6 +698,7 @@ mod tests {
         );
         let metadata = sample_metadata(SnapshotId::generate(), None);
         let committed = CommittedSnapshot {
+            delta_empty: None,
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
@@ -750,6 +756,7 @@ mod tests {
 
         let metadata = sample_metadata(snapshot_id, None);
         let committed = CommittedSnapshot {
+            delta_empty: None,
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),

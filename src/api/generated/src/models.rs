@@ -3348,7 +3348,9 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err("Missing value while parsing Node".to_string());
+                    return std::result::Result::Err(
+                        "Missing value while parsing Node".to_string(),
+                    );
                 }
             };
 
@@ -6608,6 +6610,11 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxTimeo
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotInfo {
+    /// Capture-relative disk-layer emptiness measured before compaction, covering rootfs and attached drives, not memory. True means no effective block writes, zeroing or known size changes; rewriting existing bytes still counts as nonempty. Omitted when unavailable or unknown, including snapshots from older servers. This does not change snapshot creation or reuse behavior.
+    #[serde(rename = "deltaEmpty")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_empty: Option<bool>,
+
     /// The actual snapshot ID (stable identifier). Always contains the raw snapshot UUID, never an alias.
     #[serde(rename = "snapshotID")]
     #[validate(custom(function = "check_xss_string"))]
@@ -6675,6 +6682,7 @@ impl SnapshotInfo {
         updated_at: chrono::DateTime<chrono::Utc>,
     ) -> SnapshotInfo {
         SnapshotInfo {
+            delta_empty: None,
             snapshot_id,
             names,
             cpu_count,
@@ -6696,6 +6704,9 @@ impl SnapshotInfo {
 impl std::fmt::Display for SnapshotInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
+            self.delta_empty
+                .as_ref()
+                .map(|delta_empty| ["deltaEmpty".to_string(), delta_empty.to_string()].join(",")),
             Some("snapshotID".to_string()),
             Some(self.snapshot_id.to_string()),
             Some("names".to_string()),
@@ -6756,6 +6767,7 @@ impl std::str::FromStr for SnapshotInfo {
         #[derive(Default)]
         #[allow(dead_code)]
         struct IntermediateRep {
+            pub delta_empty: Vec<bool>,
             pub snapshot_id: Vec<String>,
             pub names: Vec<Vec<String>>,
             pub cpu_count: Vec<u32>,
@@ -6788,6 +6800,10 @@ impl std::str::FromStr for SnapshotInfo {
             if let Some(key) = key_result {
                 #[allow(clippy::match_single_binding)]
                 match key {
+                    #[allow(clippy::redundant_clone)]
+                    "deltaEmpty" => intermediate_rep.delta_empty.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     #[allow(clippy::redundant_clone)]
                     "snapshotID" => intermediate_rep.snapshot_id.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
@@ -6850,6 +6866,7 @@ impl std::str::FromStr for SnapshotInfo {
 
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(SnapshotInfo {
+            delta_empty: intermediate_rep.delta_empty.into_iter().next(),
             snapshot_id: intermediate_rep
                 .snapshot_id
                 .into_iter()

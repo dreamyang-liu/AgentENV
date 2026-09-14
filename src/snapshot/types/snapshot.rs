@@ -283,6 +283,9 @@ pub struct StartupCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommittedSnapshot {
+    /// Whether this capture added no disk modifications; not a net-state diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_empty: Option<bool>,
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub runtime_versions: SnapshotRuntimeVersions,
@@ -306,6 +309,7 @@ pub struct CommittedSnapshot {
 impl CommittedSnapshot {
     pub fn mock() -> Self {
         Self {
+            delta_empty: None,
             context: CommandContext::default(),
             startup: None,
             runtime_versions: SnapshotRuntimeVersions {

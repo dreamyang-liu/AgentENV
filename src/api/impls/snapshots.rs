@@ -28,6 +28,10 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
             .map(committed_chain_stats)
             .unwrap_or((None, None, None));
         models::SnapshotInfo {
+            delta_empty: record
+                .committed
+                .as_ref()
+                .and_then(|committed| committed.delta_empty),
             snapshot_id,
             names,
             cpu_count: record.resources.cpu_count,
@@ -297,6 +301,21 @@ mod tests {
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
     };
+
+    #[test]
+    fn snapshot_info_delta_empty_preserves_boolean_and_unknown() {
+        for flag in [Some(true), Some(false), None] {
+            let mut committed = CommittedSnapshot::mock();
+            committed.delta_empty = flag;
+            let info = models::SnapshotInfo::from(SnapshotRecord::mock_ready(committed));
+            assert_eq!(info.delta_empty, flag);
+            let json = serde_json::to_value(info).unwrap();
+            match flag {
+                Some(value) => assert_eq!(json["deltaEmpty"], value),
+                None => assert!(json.get("deltaEmpty").is_none()),
+            }
+        }
+    }
 
     #[test]
     fn snapshot_info_includes_published_rootfs_image_ref() {

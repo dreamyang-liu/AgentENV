@@ -35,6 +35,82 @@ fn assert_err_contains(err: &anyhow::Error, needle: &str) {
     );
 }
 
+#[tokio::test]
+async fn delta_empty_covers_all_layouts_and_zeroing() {
+    use crate::layer::layer_metadata::read_overlaybd_layer_delta_empty;
+    for layout in [
+        RwLayout::LogStructured,
+        RwLayout::Sparse,
+        RwLayout::HybridLogStructured,
+    ] {
+        for operation in [
+            "empty",
+            "read",
+            "write",
+            "write_zero",
+            "write_restore",
+            "discard",
+            "resize",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let data_path = dir.path().join("delta.data");
+            let data = Arc::new(LocalFile::new(&data_path, test_io_ring()).await.unwrap());
+            let index = if layout == RwLayout::Sparse {
+                None
+            } else {
+                Some(Arc::new(
+                    LocalFile::new(dir.path().join("delta.index"), test_io_ring())
+                        .await
+                        .unwrap(),
+                ) as Arc<dyn VirtualFile>)
+            };
+            let mut info = LayerInfo::new(data, index, 8192);
+            info.rw_layout = layout;
+            let file = create_file_rw(info).await.unwrap();
+            match operation {
+                "read" => {
+                    file.read_at(0, 512).await.unwrap();
+                }
+                "write" => {
+                    file.write_at(0, &[7; 512]).await.unwrap();
+                }
+                "write_zero" => {
+                    file.write_at(0, &[0; 512]).await.unwrap();
+                }
+                "write_restore" => {
+                    file.write_at(0, &[7; 512]).await.unwrap();
+                    file.write_at(0, &[0; 512]).await.unwrap();
+                }
+                "discard" => {
+                    file.discard_range(0, 512).await.unwrap();
+                }
+                "resize" => {
+                    file.update_vsize(12288).await.unwrap();
+                }
+                _ => {}
+            }
+            file.close_seal().await.unwrap();
+            let expected = matches!(operation, "empty" | "read");
+            assert_eq!(
+                read_overlaybd_layer_delta_empty(&data_path, Some(8192)).unwrap(),
+                Some(expected),
+                "{layout:?} {operation}"
+            );
+            if expected {
+                assert_eq!(
+                    read_overlaybd_layer_delta_empty(&data_path, None).unwrap(),
+                    None
+                );
+            }
+            assert!(fs::metadata(&data_path).unwrap().len() > 0);
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let broken = dir.path().join("broken");
+    fs::write(&broken, b"not an overlaybd layer").unwrap();
+    assert!(read_overlaybd_layer_delta_empty(broken, Some(8192)).is_err());
+}
+
 struct CountingSizeFile {
     inner: Arc<dyn VirtualFile>,
     size_calls: std::sync::atomic::AtomicUsize,

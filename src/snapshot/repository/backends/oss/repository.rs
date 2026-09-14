@@ -290,6 +290,7 @@ impl SnapshotRepository for OssSnapshotRepository {
 
             // 4. Construct committed CommittedSnapshot.
             let committed = CommittedSnapshot {
+                delta_empty: manifest.delta_empty,
                 context: metadata.context.clone(),
                 startup: metadata.startup.clone(),
                 runtime_versions: metadata.runtime_versions.clone(),

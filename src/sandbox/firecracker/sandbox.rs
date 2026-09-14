@@ -17,7 +17,7 @@ use super::config::{
     FirecrackerSandboxConfig, FirecrackerSnapshotConfig, PersistentSnapshotRootGuard,
     MAX_EXTRA_DRIVES,
 };
-use super::manifest::FirecrackerSnapshotManifest;
+use super::manifest::{combine_disk_delta_empty, FirecrackerSnapshotManifest};
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
@@ -889,48 +889,49 @@ impl FirecrackerSandbox {
             Some((vm_state_path, mem_overlaybd_config, mem_virtual_size))
         };
 
-        let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
-            let overlaybd_source = self
-                .launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => source,
-                })
-                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
-            let rootfs_runtime = self
-                .rootfs_runtime
-                .as_ref()
-                .context("overlaybd snapshot requires an active ublk device")?;
-            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
-                &rootfs_runtime.device,
-                overlaybd_source.read_only,
-                &rootfs_runtime.image_config_path,
-                snapshot_dir,
-            )
-            .await
-            .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_image_path, size)
-        } else {
-            let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
-            // Preserve the writable disk state alongside the snapshot.
-            let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
-            copy_cow(&current_rootfs, &rootfs_path).await?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_path, size)
-        };
-        let snapshot_extra_drives = self
+        let (base_rootfs_path, rootfs_virtual_size, rootfs_delta_empty) =
+            if self.uses_overlaybd_ublk() {
+                let overlaybd_source = self
+                    .launch
+                    .common()
+                    .ublk_config
+                    .as_ref()
+                    .map(|config| match &config.backend {
+                        UblkBackend::Overlaybd(source) => source,
+                    })
+                    .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
+                let rootfs_runtime = self
+                    .rootfs_runtime
+                    .as_ref()
+                    .context("overlaybd snapshot requires an active ublk device")?;
+                let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
+                    &rootfs_runtime.device,
+                    overlaybd_source.read_only,
+                    &rootfs_runtime.image_config_path,
+                    snapshot_dir,
+                )
+                .await
+                .context("snapshot overlaybd runtime state to persistent dir")?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (rootfs_image_path.path, size, rootfs_image_path.delta_empty)
+            } else {
+                let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
+                // Preserve the writable disk state alongside the snapshot.
+                let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
+                copy_cow(&current_rootfs, &rootfs_path).await?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (rootfs_path, size, None)
+            };
+        let (snapshot_extra_drives, extra_drives_delta_empty) = self
             .snapshot_extra_drives(snapshot_dir)
             .await
             .context("snapshot extra drives to persistent dir")?;
 
-        let manifest = match &memory_artifacts {
+        let mut manifest = match &memory_artifacts {
             Some((vm_state_path, mem_overlaybd_config, mem_virtual_size)) => {
                 FirecrackerSnapshotManifest::new(
                     vm_state_path.clone(),
@@ -948,6 +949,8 @@ impl FirecrackerSandbox {
             ),
         }
         .context("build firecracker snapshot manifest")?;
+        manifest.delta_empty =
+            combine_disk_delta_empty([rootfs_delta_empty, extra_drives_delta_empty]);
 
         let snapshot = match memory_artifacts {
             Some((vm_state_path, mem_overlaybd_config, mem_virtual_size)) => {
@@ -2019,10 +2022,13 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
-    async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
+    async fn snapshot_extra_drives(
+        &self,
+        snapshot_dir: &Path,
+    ) -> Result<(Vec<ExtraDrive>, Option<bool>)> {
         let extra_drives = &self.launch.common().extra_drives;
         if extra_drives.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Some(true)));
         }
         if extra_drives.len() != self.extra_drive_runtimes.len() {
             bail!(
@@ -2033,6 +2039,7 @@ impl FirecrackerSandbox {
         }
 
         let mut snapped = Vec::with_capacity(extra_drives.len());
+        let mut deltas = Vec::with_capacity(extra_drives.len());
         for (drive, runtime) in extra_drives.iter().zip(self.extra_drive_runtimes.iter()) {
             let snapshot_image_config_path = restack_snapshot_overlaybd_device(
                 &runtime.device,
@@ -2043,14 +2050,15 @@ impl FirecrackerSandbox {
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
+            deltas.push(snapshot_image_config_path.delta_empty);
             snapped.push(
                 drive
-                    .with_image_config_path(snapshot_image_config_path)
+                    .with_image_config_path(snapshot_image_config_path.path)
                     .try_with_virtual_size(runtime.actual_virtual_size)?,
             );
         }
 
-        Ok(snapped)
+        Ok((snapped, combine_disk_delta_empty(deltas)))
     }
 
     fn runtime_image_config_paths(&self) -> Vec<PathBuf> {

@@ -193,6 +193,15 @@ components:
         - createdAt
         - updatedAt
       properties:
+        deltaEmpty:
+          type: boolean
+          description: >
+            Capture-relative disk-layer emptiness measured before compaction,
+            covering rootfs and attached drives, not memory. True means no
+            effective block writes, zeroing or known size changes; rewriting
+            existing bytes still counts as nonempty. Omitted when unavailable
+            or unknown, including snapshots from older servers. This does not
+            change snapshot creation or reuse behavior.
         snapshotID:
           type: string
           description: The actual snapshot ID (stable identifier). Always contains the raw snapshot UUID, never an alias.

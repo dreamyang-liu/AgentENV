@@ -41,6 +41,19 @@ pub fn read_overlaybd_layer_virtual_size(path: impl AsRef<Path>) -> Result<u64> 
     Ok(read_overlaybd_layer_trailer(path)?.virtual_size.get())
 }
 
+/// Whether a sealed layer has no logical mappings and unchanged virtual size.
+/// Zeroed mappings count as changes. A missing size baseline is not "empty".
+pub fn read_overlaybd_layer_delta_empty(
+    path: impl AsRef<Path>,
+    previous_virtual_size: Option<u64>,
+) -> Result<Option<bool>> {
+    let trailer = read_overlaybd_layer_trailer(path)?;
+    if trailer.index_size.get() != 0 {
+        return Ok(Some(false));
+    }
+    Ok(previous_virtual_size.map(|size| size == trailer.virtual_size.get()))
+}
+
 pub fn read_overlaybd_layer_uuid(path: impl AsRef<Path>) -> Result<Uuid> {
     let trailer = read_overlaybd_layer_trailer(path)?;
     let raw = trailer.uuid.split(|b| *b == 0).next().unwrap_or(&[]);

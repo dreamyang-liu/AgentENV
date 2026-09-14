@@ -27,6 +27,38 @@ Recoverable failures leave the sandbox running and surface the error to the
 caller. Terminal failures — where the runtime was mutated past safe resume —
 tear down the sandbox.
 
+### Disk delta emptiness tag
+
+Snapshot creation, lookup and list responses may include `deltaEmpty`:
+
+```json
+{"snapshotID": "...", "deltaEmpty": true}
+```
+
+This is a capture-relative observation of **disk modifications**, not memory
+state or a whole-filesystem hash. `true` means the captured rootfs and attached
+drives have no effective block mappings (including zeroing) and no detected
+virtual-size change. `false` means at least one disk has a modification. Writing
+the original value again, or writing and restoring it within the interval,
+still counts as nonempty. Filesystem metadata and log writes count too.
+
+The measurement is taken from the newly sealed upper before layer compaction,
+so an empty interval stays tagged empty even when it is merged with older
+nonempty layers. The tag is persisted with the snapshot; it never changes
+snapshot creation, retention or reuse policy. First captures include writes
+since the writable upper was created, including guest startup work.
+
+The field is omitted when the measurement is unavailable, for older snapshots,
+or when an otherwise empty layer has no readable size baseline. Unknown must
+not be treated as empty. A known modification on any disk is sufficient for
+`false`, even if another disk could not be measured. Non-OverlayBD rootfs paths
+remain unknown unless an attached drive supplies positive modification evidence.
+
+Read-only shell commands do not guarantee `true`: the guest `sync` run before
+capture may itself be logged by envd on disk. To test a genuinely quiet interval,
+control those background writes as well. No production logging is suppressed
+by this feature.
+
 ### Disk-Only Snapshots
 
 By default a snapshot captures the full runtime: rootfs deltas, attached-drive

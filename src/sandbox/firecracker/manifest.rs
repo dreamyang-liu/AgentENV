@@ -7,6 +7,24 @@ use crate::sandbox::ExtraDrive;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
+pub(crate) fn combine_disk_delta_empty(
+    values: impl IntoIterator<Item = Option<bool>>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for value in values {
+        match value {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(true)
+    }
+}
+
 /// Manifest describing the on-disk layout of a Firecracker snapshot.
 ///
 /// This is intentionally decoupled from in-memory snapshot representations.
@@ -19,6 +37,9 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub struct FirecrackerSnapshotManifest {
     /// Schema/version marker for persisted manifest format.
     pub version: u32,
+    /// Capture-relative disk delta only, before compaction; memory is excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_empty: Option<bool>,
     /// Firecracker VM state artifact. `None` for disk-only snapshots, which
     /// carry no resumable VM state and can only boot fresh from their rootfs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +99,7 @@ impl FirecrackerSnapshotManifest {
     ) -> Result<Self> {
         Self {
             version: MANIFEST_FORMAT_VERSION,
+            delta_empty: None,
             vm_state: Some(FirecrackerVmStateArtifacts {
                 path: vm_state_path.into(),
             }),
@@ -104,6 +126,7 @@ impl FirecrackerSnapshotManifest {
     ) -> Result<Self> {
         Self {
             version: MANIFEST_FORMAT_VERSION,
+            delta_empty: None,
             vm_state: None,
             memory: None,
             rootfs: FirecrackerRootfsArtifacts {
@@ -203,6 +226,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disk_delta_empty_aggregation_preserves_unknown_and_writes() {
+        assert_eq!(combine_disk_delta_empty([]), Some(true));
+        assert_eq!(
+            combine_disk_delta_empty([Some(true), Some(true)]),
+            Some(true)
+        );
+        assert_eq!(combine_disk_delta_empty([Some(true), None]), None);
+        assert_eq!(combine_disk_delta_empty([None, Some(false)]), Some(false));
+        assert_eq!(combine_disk_delta_empty([Some(false), None]), Some(false));
+    }
+
+    #[test]
+    fn delta_empty_manifest_round_trip_and_legacy_default() {
+        let mut manifest =
+            FirecrackerSnapshotManifest::new_disk_only("rootfs/image.json", 8192, &[]).unwrap();
+        let old_json = serde_json::to_value(&manifest).unwrap();
+        assert!(old_json.get("deltaEmpty").is_none());
+        assert_eq!(
+            serde_json::from_value::<FirecrackerSnapshotManifest>(old_json)
+                .unwrap()
+                .delta_empty,
+            None
+        );
+        for flag in [true, false] {
+            manifest.delta_empty = Some(flag);
+            let json = serde_json::to_value(&manifest).unwrap();
+            assert_eq!(json["deltaEmpty"], flag);
+            assert_eq!(
+                serde_json::from_value::<FirecrackerSnapshotManifest>(json)
+                    .unwrap()
+                    .delta_empty,
+                Some(flag)
+            );
+        }
+    }
+
+    #[test]
     fn attached_drive_virtual_size_is_required() {
         let err = serde_json::from_value::<FirecrackerAttachedDriveArtifacts>(serde_json::json!({
             "driveId": "data",
@@ -230,6 +290,7 @@ mod tests {
 
         let manifest = FirecrackerSnapshotManifest {
             version: MANIFEST_FORMAT_VERSION,
+            delta_empty: None,
             vm_state: Some(FirecrackerVmStateArtifacts {
                 path: PathBuf::from("vm_state.bin"),
             }),

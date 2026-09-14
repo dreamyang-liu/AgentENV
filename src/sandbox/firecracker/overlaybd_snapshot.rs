@@ -19,6 +19,9 @@ use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
+use overlaybd::layer_metadata::{
+    read_overlaybd_layer_delta_empty, read_overlaybd_layer_virtual_size, resolve_local_layer_path,
+};
 use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
@@ -69,23 +72,32 @@ const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
-    Restacked(PathBuf),
+    Restacked(PathBuf, Option<bool>),
 }
 
 impl LiveOverlaybdSnapshotState {
     fn snapshot_layer_path(&self) -> Option<&Path> {
         match self {
             Self::ReadOnly => None,
-            Self::Restacked(path) => Some(path.as_path()),
+            Self::Restacked(path, _) => Some(path.as_path()),
         }
     }
 
-    fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<PathBuf> {
-        match self {
-            Self::ReadOnly => staged_snapshot,
-            Self::Restacked(_) => staged_snapshot.map_err(into_terminal_snapshot_failure),
-        }
+    fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<OverlaybdDiskSnapshot> {
+        let (path, delta_empty) = match self {
+            Self::ReadOnly => (staged_snapshot?, Some(true)),
+            Self::Restacked(_, delta_empty) => (
+                staged_snapshot.map_err(into_terminal_snapshot_failure)?,
+                delta_empty,
+            ),
+        };
+        Ok(OverlaybdDiskSnapshot { path, delta_empty })
     }
+}
+
+pub(super) struct OverlaybdDiskSnapshot {
+    pub path: PathBuf,
+    pub delta_empty: Option<bool>,
 }
 
 fn into_terminal_snapshot_failure(err: anyhow::Error) -> anyhow::Error {
@@ -538,6 +550,11 @@ async fn capture_live_overlaybd_snapshot(
 
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
         .context("resolve restack source upper path")?;
+    let previous_virtual_size =
+        overlaybd::config::load_image_config(live_runtime_image_config_path)
+            .ok()
+            .and_then(|config| config.lowers.last().and_then(resolve_local_layer_path))
+            .and_then(|path| read_overlaybd_layer_virtual_size(path).ok());
     let snapshot_layer_path = output_dir.join("snapshot.commit");
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
     let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
@@ -610,7 +627,18 @@ async fn capture_live_overlaybd_snapshot(
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
-    Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
+    let delta_empty =
+        match read_overlaybd_layer_delta_empty(&snapshot_layer_path, previous_virtual_size) {
+            Ok(empty) => empty,
+            Err(error) => {
+                warn!(%error, "disk delta measurement unavailable; preserving unknown tag");
+                None
+            }
+        };
+    Ok(LiveOverlaybdSnapshotState::Restacked(
+        snapshot_layer_path,
+        delta_empty,
+    ))
 }
 
 pub(super) async fn build_mem_snapshot_image_config(
@@ -649,7 +677,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     kind: &'static str,
-) -> Result<PathBuf> {
+) -> Result<OverlaybdDiskSnapshot> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
@@ -678,7 +706,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
-) -> Result<PathBuf> {
+) -> Result<OverlaybdDiskSnapshot> {
     restack_snapshot_overlaybd_device(
         ublk_device,
         read_only,
