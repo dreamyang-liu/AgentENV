@@ -103,8 +103,18 @@ if [ ! -x /usr/bin/nice ]; then
     $BB ln -sf /agentenv/bin/busybox /usr/bin/nice
 fi
 
+# Keep AgentENV's own logs off the task's disk. Snapshot preparation invokes
+# envd's sync command, whose process logs would otherwise make even an idle
+# disk-only capture nonempty. Mount before any logger opens a file, including
+# envd stderr and runsv diagnostics. Cold boots repeat this setup; full memory
+# restores retain the existing mount. Task/application log directories are
+# unaffected. The limit bounds aggregate log memory, not a reserved allocation.
+$BB mkdir -p /var/log/agentenv
+$BB mount -n -t tmpfs -o size=16m,mode=0755,nosuid,nodev,noexec \
+    tmpfs /var/log/agentenv || die "mount AgentENV log tmpfs"
+
 # Prepare remaining runtime directories envd and the guest init commonly
-# expect (/run is already mounted above as a tmpfs).
+# expect (/run and /var/log/agentenv are already memory-backed).
 $BB mkdir -p /var/run /tmp /var/log/agentenv/envd /run/sv/envd/log
 
 # Populate /etc/resolv.conf from the kernel's ip=... boot parameter state so
@@ -120,7 +130,7 @@ generate_resolv_conf
 # for runsv and svlogd since no applet symlinks are created.
 $BB cat > /run/sv/envd/run << 'RUNSV_EOF'
 #!/agentenv/bin/busybox sh
-exec 2>>/var/log/agentenv/envd.stderr.log  # append across restarts; unbounded but VM-ephemeral
+exec 2>>/var/log/agentenv/envd.stderr.log  # append across process restarts within the bounded tmpfs
 exec /agentenv/envd
 RUNSV_EOF
 $BB chmod 0755 /run/sv/envd/run

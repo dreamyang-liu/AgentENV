@@ -149,3 +149,29 @@ directory under `deps_path`; changing its contents requires a new version.
 Root filesystem resizing is performed by the host-side `overlaybd-resize`
 binary installed from the OverlayBD package under `deps_path`; it is not part
 of this guest tools drive.
+
+## Guest infrastructure logs
+
+This behavior applies to tools drives built from this source. Updating the source
+checkout does not replace the immutable prebuilt drive pinned in
+`config/deps_manifest.toml`. Build with a new `TOOLS_VERSION` and select that
+version through the tools configuration above.
+
+The guest init mounts `/var/log/agentenv` as a dedicated 16 MiB `tmpfs` before
+starting envd, its supervisor and its log writer. The capacity is a limit, not
+16 MiB of preallocated memory. Mount failure prevents envd startup rather than
+silently falling back to the task disk. Other application logs, `/tmp`, task
+files and root filesystem access-time settings are unchanged.
+
+This keeps snapshot preparation's own envd process logs out of disk deltas.
+It does not imply that every read produces an empty delta: filesystem access
+times or other guest processes may still write to disk. Log storage remains
+bounded by the tmpfs limit; collect infrastructure logs outside the VM if they
+must survive a cold boot.
+
+Disk-only restore runs init again and starts with empty infrastructure logs.
+A full memory snapshot retains the mount and its contents. Snapshots pin the
+tools drive version, so installing a new version changes fresh image boots;
+existing templates/snapshots continue using their recorded version. Create new
+templates to adopt this behavior without overwriting old tools assets or
+rewriting historical snapshot metadata.
